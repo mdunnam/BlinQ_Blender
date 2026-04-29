@@ -1,0 +1,17 @@
+schema_version = "1.0.0"
+
+id = "blinq_blender"
+version = "0.1.0"
+name = "BlinQ Blender"
+tagline = "XMD ToolBox bridge and asset library management"
+maintainer = "XMD Team"
+type = "add-on"
+
+blender_version_min = "4.5.0"
+blender_version_max = "5.99.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+network = "XMD Cloud license validation"
+files = "XMD library index, catalog, and asset file management"
