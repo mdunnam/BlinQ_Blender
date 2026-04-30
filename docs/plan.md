@@ -223,11 +223,11 @@ Managed by XMD Cloud; add-on exposes login, sync state, and review UI only.
 
 > **Goal:** Add-on installs cleanly, bridge is live, activation is working.
 
-- [ ] Add-on scaffold: register/unregister, preferences, version detection
-- [ ] XMD Cloud activation: key entry, startup check, token cache, offline grace, status UI
-- [ ] Bridge transport: file-based IPC, heartbeat monitor, connection status indicator
-- [ ] Logging and diagnostics panel
-- [ ] Cross-version compatibility: 4.5 LTS, 5.0, 5.1
+- [x] Add-on scaffold: register/unregister, preferences, version detection
+- [x] XMD Cloud activation: key entry, startup check, token cache, offline grace, status UI
+- [x] Bridge transport: file-based IPC, heartbeat monitor, connection status indicator
+- [x] Logging and diagnostics panel
+- [ ] Cross-version compatibility: 4.5 LTS, 5.0, 5.1 *(verified on 5.1; 4.5/5.0 not yet smoke-tested)*
 
 **Exit criteria:** Add-on installs on all three Blender versions, shows bridge status, correctly enforces/bypasses activation state.
 
@@ -237,19 +237,19 @@ Managed by XMD Cloud; add-on exposes login, sync state, and review UI only.
 
 > **Goal:** Artists can roundtrip assets between ZBrush and Blender, and see XMD assets in the Asset Browser.
 
-- [ ] Send Mesh to Blender (OBJ)
-- [ ] Send Mesh back to ZBrush
-- [ ] Send Texture / Material
-- [ ] Polypaint → Blender vertex color roundtrip
-- [ ] Face Set / PolyGroup roundtrip
-- [ ] Asset Browser registration — mark assets, write metadata, generate previews
-- [ ] "Add to XMD Library" context action
-- [ ] Metadata sync: tags, author, catalog, description
-- [ ] Preview sync: schedule and update Asset Browser thumbnails
-- [ ] UUID tagging and deterministic naming
-- [ ] XMD N-panel (bridge status, send/return, quick library actions)
-- [ ] XMD Pie Menu (core actions)
-- [ ] Retopo state tracker
+- [x] Send Mesh to Blender (OBJ)
+- [x] Send Mesh back to ZBrush
+- [x] Send Texture / Material
+- [ ] Polypaint → Blender vertex color roundtrip *(blocked on XMD Desktop schema)*
+- [ ] Face Set / PolyGroup roundtrip *(blocked on XMD Desktop schema)*
+- [x] Asset Browser registration — mark assets, write metadata, generate previews
+- [x] "Add to XMD Library" context action
+- [x] Metadata sync: tags, author, catalog, description
+- [x] Preview sync: schedule and update Asset Browser thumbnails
+- [x] UUID tagging and deterministic naming
+- [x] XMD N-panel (bridge status, send/return, quick library actions)
+- [x] XMD Pie Menu (core actions)
+- [x] Retopo state tracker
 
 **Exit criteria:** End-to-end roundtrip works reliably; XMD assets visible and searchable in Asset Browser.
 
@@ -259,14 +259,14 @@ Managed by XMD Cloud; add-on exposes login, sync state, and review UI only.
 
 > **Goal:** Artists can manage a full asset lifecycle from import through review without leaving the product.
 
-- [ ] Workflow stacks — define, activate, step through, export/import
-- [ ] Random Kit generator
-- [ ] Challenge generator
-- [ ] Reference board — import, annotate, arrange
-- [ ] Review snapshots — capture, compare, export contact sheet
-- [ ] Light-rig / HDRI browser
-- [ ] Render preset library
-- [ ] Batch metadata QC tools
+- [x] Workflow stacks — define, activate, step through *(import/export deferred)*
+- [x] Random Kit generator
+- [x] Challenge generator
+- [x] Reference board — import, list, open *(annotate, arrange deferred to Phase 5)*
+- [x] Review snapshots — capture viewport *(compare and contact-sheet deferred)*
+- [x] Light-rig / HDRI browser *(HDRI loader done; light-rig collection presets deferred)*
+- [x] Render preset library
+- [x] Batch metadata QC tools
 
 **Exit criteria:** Artists can run a complete sculpt-to-review session using only BlinQ surfaces.
 

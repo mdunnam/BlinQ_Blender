@@ -23,6 +23,7 @@ from typing import Any
 
 import bpy
 
+from .. import diagnostics
 from ..models import BridgeCommandType
 
 
@@ -136,6 +137,11 @@ class IPCTransport:
         self._dir = work_dir
         self._ensure_dirs()
 
+    @property
+    def work_dir(self) -> Path:
+        """Absolute path to the bridge work directory."""
+        return self._dir
+
     def _ensure_dirs(self) -> None:
         """Create work_dir and transfer subdirectories if they do not exist."""
         for sub in ("", "mesh_in", "mesh_out", "textures_in", "textures_out"):
@@ -211,7 +217,7 @@ class IPCTransport:
         try:
             path.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except OSError as exc:
-            print(f"[BlinQ IPC] Write failed '{filename}': {exc}")
+            diagnostics.warn("bridge", f"write failed '{filename}': {exc}")
 
     def _read_json(self, filename: str) -> dict[str, Any] | None:
         path = self._dir / filename
@@ -244,7 +250,7 @@ class HeartbeatMonitor:
         if not self._registered:
             bpy.app.timers.register(_poll_bridge, first_interval=1.5)
             self._registered = True
-            print("[BlinQ] Bridge timer started.")
+            diagnostics.info("bridge", "heartbeat timer started")
 
     def stop(self) -> None:
         """Unregister the bridge poll timer if it is running."""
@@ -254,7 +260,7 @@ class HeartbeatMonitor:
             except ValueError:
                 pass
             self._registered = False
-            print("[BlinQ] Bridge timer stopped.")
+            diagnostics.info("bridge", "heartbeat timer stopped")
 
 
 # Singleton
@@ -306,6 +312,7 @@ def _poll_bridge() -> float:
 
         if getattr(prefs, "bridge_status", "DISCONNECTED") != new_status:
             prefs.bridge_status = new_status
+            diagnostics.info("bridge", f"XMD Desktop {new_status.lower()}")
             _redraw_panels()
 
         # Dispatch any pending command from XMD Desktop
@@ -315,7 +322,7 @@ def _poll_bridge() -> float:
             _dispatch(transport, cmd)
 
     except Exception as exc:
-        print(f"[BlinQ] Bridge poll error: {exc}")
+        diagnostics.error("bridge", f"poll error: {exc}")
         try:
             prefs.bridge_status = "ERROR"
         except Exception:
@@ -348,6 +355,7 @@ def _dispatch(transport: IPCTransport, cmd: CommandEnvelope) -> None:
     from . import io as bridge_io
 
     if cmd.command == BridgeCommandType.PING.value:
+        diagnostics.debug("bridge", f"PING received id={cmd.id[:8]}")
         transport.write_response(
             ResponseEnvelope(id=cmd.id, command=cmd.command, result={"pong": True})
         )
@@ -359,11 +367,13 @@ def _dispatch(transport: IPCTransport, cmd: CommandEnvelope) -> None:
         def _deferred_import() -> None:
             try:
                 result = bridge_io.MeshImporter(transport).execute(payload)
+                imported = result.get("imported", [])
+                diagnostics.info("bridge", f"received mesh: {', '.join(imported) or '(none)'}")
                 transport.write_response(
                     ResponseEnvelope(id=cmd.id, command=cmd.command, result=result)
                 )
             except Exception as exc:
-                print(f"[BlinQ] Mesh import error: {exc}")
+                diagnostics.error("bridge", f"mesh import failed: {exc}")
                 transport.write_response(
                     ResponseEnvelope(
                         id=cmd.id, command=cmd.command, status="error", error=str(exc)
@@ -379,11 +389,12 @@ def _dispatch(transport: IPCTransport, cmd: CommandEnvelope) -> None:
         def _deferred_texture() -> None:
             try:
                 result = bridge_io.TextureImporter(transport).execute(payload)
+                diagnostics.info("bridge", f"received texture: {result.get('image', '?')}")
                 transport.write_response(
                     ResponseEnvelope(id=cmd.id, command=cmd.command, result=result)
                 )
             except Exception as exc:
-                print(f"[BlinQ] Texture import error: {exc}")
+                diagnostics.error("bridge", f"texture import failed: {exc}")
                 transport.write_response(
                     ResponseEnvelope(
                         id=cmd.id, command=cmd.command, status="error", error=str(exc)
@@ -394,6 +405,7 @@ def _dispatch(transport: IPCTransport, cmd: CommandEnvelope) -> None:
         return
 
     # Unknown command — acknowledge with a warning
+    diagnostics.warn("bridge", f"unknown command from XMD Desktop: '{cmd.command}'")
     transport.write_response(
         ResponseEnvelope(
             id=cmd.id,

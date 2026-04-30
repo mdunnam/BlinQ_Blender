@@ -137,6 +137,18 @@ class XMDPreferences(bpy.types.AddonPreferences):
 
     show_advanced: BoolProperty(name="Show Advanced", default=False)  # type: ignore[assignment]
 
+    diagnostics_min_level: EnumProperty(  # type: ignore[assignment]
+        name="Log Level",
+        description="Minimum severity to display in the Diagnostics panel",
+        items=[
+            ("DEBUG", "Debug",  "Show all log entries",          "DOT",        0),
+            ("INFO",  "Info",   "Show info, warnings, errors",   "INFO",       1),
+            ("WARN",  "Warn",   "Show warnings and errors only", "ERROR",      2),
+            ("ERROR", "Error",  "Show errors only",              "CANCEL",     3),
+        ],
+        default="INFO",
+    )
+
     # ------------------------------------------------------------------ draw
 
     def draw(self, context: bpy.types.Context) -> None:

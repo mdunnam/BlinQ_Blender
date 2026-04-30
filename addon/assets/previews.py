@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import bpy
 
+from .. import diagnostics
+
 
 class PreviewManager:
     """Schedules asset preview generation for BlinQ-registered datablocks.
@@ -33,22 +35,23 @@ class PreviewManager:
             """Run the deferred preview generation."""
             collection = getattr(bpy.data, bpy_collection, None)
             if collection is None:
-                print(f"[BlinQ] Unknown bpy.data collection: '{bpy_collection}'")
+                diagnostics.error("preview", f"unknown bpy.data collection: '{bpy_collection}'")
                 return
 
             datablock = collection.get(datablock_name)
             if datablock is None:
-                print(f"[BlinQ] Datablock not found for preview: '{datablock_name}'")
+                diagnostics.warn("preview", f"datablock not found: '{datablock_name}'")
                 return
 
             if not datablock.asset_data:
-                print(f"[BlinQ] Not an asset, skipping preview: '{datablock_name}'")
+                diagnostics.warn("preview", f"not an asset, skipping: '{datablock_name}'")
                 return
 
             try:
                 with bpy.context.temp_override(id=datablock):
                     bpy.ops.ed.lib_id_generate_preview()
+                diagnostics.debug("preview", f"regenerated preview for '{datablock_name}'")
             except Exception as exc:
-                print(f"[BlinQ] Preview generation failed for '{datablock_name}': {exc}")
+                diagnostics.error("preview", f"generation failed for '{datablock_name}': {exc}")
 
         bpy.app.timers.register(_generate, first_interval=0.1)

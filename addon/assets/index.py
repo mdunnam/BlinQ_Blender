@@ -21,6 +21,7 @@ from typing import Iterator
 
 import bpy
 
+from .. import diagnostics
 from ..models import AssetRecord, AssetType
 
 
@@ -63,7 +64,7 @@ class XMDIndex:
         try:
             raw = json.loads(self.index_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError) as exc:
-            print(f"[BlinQ] Failed to load index: {exc}")
+            diagnostics.error("asset", f"failed to load index: {exc}")
             return
 
         for entry in raw.get("assets", []):
@@ -71,7 +72,7 @@ class XMDIndex:
                 record = AssetRecord.from_dict(entry)
                 self._records[record.xmd_uuid] = record
             except (TypeError, KeyError) as exc:
-                print(f"[BlinQ] Skipping malformed index entry: {exc}")
+                diagnostics.warn("asset", f"skipping malformed index entry: {exc}")
 
     def save(self) -> None:
         """Persist the current in-memory index to xmd_index.json.

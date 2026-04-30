@@ -194,6 +194,116 @@ class RetopoRecord:
 
 
 @dataclass
+class ReferenceItem:
+    """A single image entry on the BlinQ Reference Board.
+
+    Attributes:
+        id: Stable UUID4.
+        name: Display name (defaults to the file stem).
+        file_path: Absolute filesystem path to the image.
+        note: Free-form text annotation attached to this reference.
+        image_name: Blender Image datablock name once the file is loaded.
+        created_at: ISO-8601 UTC timestamp of first registration.
+    """
+
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    name: str = ""
+    file_path: str = ""
+    note: str = ""
+    image_name: str = ""
+    created_at: str = field(default_factory=_now)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a plain dictionary."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ReferenceItem:
+        """Deserialize from a plain dictionary, ignoring unknown keys."""
+        known = {f for f in cls.__dataclass_fields__}
+        return cls(**{k: v for k, v in data.items() if k in known})
+
+
+@dataclass
+class ReviewSnapshot:
+    """A single review snapshot captured from the viewport or a render.
+
+    Attributes:
+        id: Stable UUID4.
+        name: Display name (typically auto-generated from timestamp).
+        file_path: Absolute filesystem path to the captured PNG.
+        kind: ``"viewport"`` or ``"render"``.
+        scene_name: Name of the scene that was captured.
+        camera_name: Name of the camera used (if any).
+        note: Free-form annotation.
+        created_at: ISO-8601 UTC timestamp.
+    """
+
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    name: str = ""
+    file_path: str = ""
+    kind: str = "viewport"
+    scene_name: str = ""
+    camera_name: str = ""
+    note: str = ""
+    created_at: str = field(default_factory=_now)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a plain dictionary."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ReviewSnapshot:
+        """Deserialize from a plain dictionary, ignoring unknown keys."""
+        known = {f for f in cls.__dataclass_fields__}
+        return cls(**{k: v for k, v in data.items() if k in known})
+
+
+@dataclass
+class RenderPreset:
+    """A snapshot of render-relevant scene settings.
+
+    Attributes:
+        id: Stable UUID4.
+        name: Display name.
+        engine: Render engine identifier (``CYCLES``, ``BLENDER_EEVEE_NEXT``, etc).
+        resolution_x: Width in pixels.
+        resolution_y: Height in pixels.
+        resolution_percentage: Render resolution scale (1-100+).
+        file_format: ``scene.render.image_settings.file_format`` value.
+        samples: Engine-agnostic sample count. Maps to ``cycles.samples`` for
+            Cycles or ``eevee.taa_render_samples`` for EEVEE.
+        output_path: ``scene.render.filepath``.
+        view_transform: Color management view transform.
+        look: Color management look.
+        created_at: ISO-8601 UTC timestamp.
+    """
+
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    name: str = ""
+    engine: str = "CYCLES"
+    resolution_x: int = 1920
+    resolution_y: int = 1080
+    resolution_percentage: int = 100
+    file_format: str = "PNG"
+    samples: int = 64
+    output_path: str = "//render/"
+    view_transform: str = "Standard"
+    look: str = "None"
+    created_at: str = field(default_factory=_now)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a plain dictionary."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> RenderPreset:
+        """Deserialize from a plain dictionary, ignoring unknown keys."""
+        known = {f for f in cls.__dataclass_fields__}
+        return cls(**{k: v for k, v in data.items() if k in known})
+
+
+@dataclass
 class WorkflowStack:
     """A named sequence of pipeline steps associated with an asset.
 

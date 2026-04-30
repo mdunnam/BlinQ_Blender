@@ -12,6 +12,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .. import diagnostics
 from ..models import RetopoRecord, RetopoState, WorkflowStack
 
 
@@ -47,7 +48,7 @@ class RetopoTracker:
                 if rec.xmd_uuid:
                     self._records[rec.xmd_uuid] = rec
         except (json.JSONDecodeError, OSError, KeyError) as exc:
-            print(f"[BlinQ] Failed to load retopo tracker: {exc}")
+            diagnostics.error("workflow", f"failed to load retopo tracker: {exc}")
 
     def save(self) -> None:
         """Persist retopo records to disk."""
@@ -174,7 +175,7 @@ class WorkflowService:
                 ws = WorkflowStack.from_dict(entry)
                 self._stacks[ws.id] = ws
         except (json.JSONDecodeError, OSError, KeyError) as exc:
-            print(f"[BlinQ] Failed to load workflow stacks: {exc}")
+            diagnostics.error("workflow", f"failed to load workflow stacks: {exc}")
 
     def save(self) -> None:
         """Persist workflow stacks to disk."""

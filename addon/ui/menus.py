@@ -11,6 +11,7 @@ from pathlib import Path
 import bpy
 from bpy.props import EnumProperty, StringProperty
 
+from .. import diagnostics
 from ..assets.index import CatalogManager, MetadataMapper, XMDIndex
 from ..assets.previews import PreviewManager
 from ..models import RetopoState
@@ -169,6 +170,10 @@ class BLINQ_OT_register_asset(bpy.types.Operator):
         from ..ui.panels import invalidate_library_cache
         invalidate_library_cache()
 
+        diagnostics.info(
+            "asset",
+            f"registered '{datablock.name}' ({record.asset_type}) uuid={record.xmd_uuid[:8]}",
+        )
         self.report(
             {"INFO"},
             f"Registered '{datablock.name}' ({record.asset_type}) \u2014 UUID {record.xmd_uuid[:8]}\u2026",
@@ -561,20 +566,16 @@ class BLINQ_OT_sign_in(bpy.types.Operator):
         ok, msg = client.login(username, password)
         if not ok:
             prefs.activation_status = "UNLICENSED"
+            diagnostics.warn("cloud", f"login failed: {msg}")
             self.report({"ERROR"}, msg)
             return {"CANCELLED"}
 
+        diagnostics.info("cloud", f"signed in as {prefs.xmdsource_display_name or username}")
+
         # Login succeeded — now sync the runtime license
         ok2, _, msg2 = client.sync_runtime_license()
-        if ok2 and prefs.xmdsource_runtime_product_id:
-            if prefs.xmdsource_runtime_lease_id or prefs.xmdsource_runtime_product_id:
-                prefs.activation_status = "ACTIVE"
-            else:
-                prefs.activation_status = "ACTIVE"
-        elif ok2:
-            prefs.activation_status = "NO_ACCESS"
-        else:
-            prefs.activation_status = "UNLICENSED"
+        prefs.activation_status = client.resolve_activation_status(ok2, msg2)
+        diagnostics.info("cloud", f"activation status → {prefs.activation_status}")
 
         self.report({"INFO"}, msg)
         return {"FINISHED"}
@@ -602,6 +603,7 @@ class BLINQ_OT_sign_out(bpy.types.Operator):
         client = CloudClient(prefs)
         client.logout()
         prefs.activation_status = "UNLICENSED"
+        diagnostics.info("cloud", "signed out")
         self.report({"INFO"}, "Signed out of XMDSource")
         return {"FINISHED"}
 
@@ -634,17 +636,8 @@ class BLINQ_OT_check_activation(bpy.types.Operator):
 
         prefs.activation_status = "CHECKING"
         ok, _, msg = client.sync_runtime_license()
-
-        if ok and prefs.xmdsource_runtime_product_id:
-            if client.has_active_runtime_access():
-                prefs.activation_status = "ACTIVE"
-            else:
-                ok2, cached_msg = client.cached_runtime_access_status(msg)
-                prefs.activation_status = "OFFLINE" if ok2 else "NO_ACCESS"
-        elif "grace" in msg.lower() or "cached" in msg.lower():
-            prefs.activation_status = "OFFLINE"
-        else:
-            prefs.activation_status = "EXPIRED" if "expired" in msg.lower() else "UNLICENSED"
+        prefs.activation_status = client.resolve_activation_status(ok, msg)
+        diagnostics.info("cloud", f"activation refresh → {prefs.activation_status}")
 
         self.report({"INFO"}, msg)
         return {"FINISHED"}
@@ -695,12 +688,17 @@ class BLINQ_OT_send_mesh(bpy.types.Operator):
         try:
             from ..bridge.io import MeshExporter
             result = MeshExporter(transport).execute()
+            diagnostics.info(
+                "bridge",
+                f"sent mesh: {result['objects']} object(s) \u2192 {result['file']}",
+            )
             self.report(
                 {"INFO"},
                 f"Sent {result['objects']} object(s) \u2014 {result['file']}",
             )
             return {"FINISHED"}
         except Exception as exc:
+            diagnostics.error("bridge", f"send mesh failed: {exc}")
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
 
@@ -756,9 +754,11 @@ class BLINQ_OT_receive_mesh(bpy.types.Operator):
         try:
             from ..bridge.io import MeshImporter
             result = MeshImporter(transport).execute({"file": latest.name})
+            diagnostics.info("bridge", f"imported {latest.name}: {', '.join(result['imported'])}")
             self.report({"INFO"}, f"Imported: {', '.join(result['imported'])}")
             return {"FINISHED"}
         except Exception as exc:
+            diagnostics.error("bridge", f"receive mesh failed: {exc}")
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
 
@@ -840,6 +840,7 @@ class BLINQ_OT_send_texture(bpy.types.Operator):
             )
         )
 
+        diagnostics.info("bridge", f"sent texture: {src.name}")
         self.report({"INFO"}, f"Texture sent: {src.name}")
         return {"FINISHED"}
 
@@ -852,6 +853,249 @@ _RETOPO_STATE_ITEMS = [
     (s.value, s.value.replace("_", " ").title(), "")
     for s in RetopoState
 ]
+
+
+# ---------------------------------------------------------------------------
+# ── Workflow operators ───────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+def _workflow_service(context: bpy.types.Context):
+    """Return a loaded WorkflowService for the configured library path, or None.
+
+    Args:
+        context: The current Blender context.
+
+    Returns:
+        A loaded ``WorkflowService`` or ``None`` if no library path is set.
+    """
+    prefs = get_prefs(context)
+    if not prefs.library_path:
+        return None
+    from ..workflow.service import WorkflowService
+    svc = WorkflowService(Path(prefs.library_path))
+    svc.load()
+    return svc
+
+
+class BLINQ_OT_workflow_create(bpy.types.Operator):
+    """Create a new workflow stack with the default sculpt pipeline."""
+
+    bl_idname = "blinq.workflow_create"
+    bl_label = "New Workflow Stack"
+    bl_description = "Create a new workflow stack and set it active for this scene"
+    bl_options = {"REGISTER", "UNDO"}
+
+    name: StringProperty(  # type: ignore[assignment]
+        name="Stack Name",
+        description="Display name for the new workflow stack",
+        default="",
+    )
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        """Enable when an XMD library path is configured."""
+        return bool(get_prefs(context).library_path)
+
+    def invoke(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
+        """Show the new-stack dialog with the default step list previewed."""
+        self.name = ""
+        return context.window_manager.invoke_props_dialog(self, width=320)
+
+    def draw(self, context: bpy.types.Context) -> None:
+        """Draw the dialog body — name input plus a non-editable preview of default steps."""
+        from ..workflow.service import WorkflowService
+        layout = self.layout
+        layout.prop(self, "name", text="Name")
+        col = layout.column(align=True)
+        col.label(text="Default steps:", icon="SEQUENCE")
+        for step in WorkflowService.DEFAULT_STEPS:
+            row = col.row()
+            row.enabled = False
+            row.label(text=f"  {step}")
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        """Create the stack via WorkflowService and set it active for the scene."""
+        name = self.name.strip()
+        if not name:
+            self.report({"WARNING"}, "Stack name cannot be empty")
+            return {"CANCELLED"}
+
+        svc = _workflow_service(context)
+        if svc is None:
+            self.report({"WARNING"}, "Set the XMD Library Path in Add-on Preferences first")
+            return {"CANCELLED"}
+
+        stack = svc.create(name=name)
+        context.scene.xmd_active_workflow_id = stack.id
+
+        diagnostics.info(
+            "workflow",
+            f"created stack '{stack.name}' ({len(stack.steps)} steps), set active",
+        )
+        self.report({"INFO"}, f"Created '{stack.name}'")
+        return {"FINISHED"}
+
+
+class BLINQ_OT_workflow_select(bpy.types.Operator):
+    """Set the active workflow stack for the current scene."""
+
+    bl_idname = "blinq.workflow_select"
+    bl_label = "Select Workflow Stack"
+    bl_description = "Make this workflow stack the active one for the current scene"
+    bl_options = {"REGISTER", "UNDO"}
+
+    stack_id: StringProperty(name="Stack ID", default="")  # type: ignore[assignment]
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        """Persist the selected stack ID on Scene.xmd_active_workflow_id."""
+        if not self.stack_id:
+            return {"CANCELLED"}
+        context.scene.xmd_active_workflow_id = self.stack_id
+        return {"FINISHED"}
+
+
+class BLINQ_OT_workflow_clear_active(bpy.types.Operator):
+    """Clear the active workflow stack for the current scene."""
+
+    bl_idname = "blinq.workflow_clear_active"
+    bl_label = "Clear Active Workflow"
+    bl_description = "Detach the active workflow stack from this scene"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        """Empty the scene's xmd_active_workflow_id property."""
+        context.scene.xmd_active_workflow_id = ""
+        return {"FINISHED"}
+
+
+class BLINQ_OT_workflow_advance(bpy.types.Operator):
+    """Advance the active workflow stack by one step."""
+
+    bl_idname = "blinq.workflow_advance"
+    bl_label = "Advance Step"
+    bl_description = "Move the active workflow stack to the next step"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        """Enable only when an active stack is set on the scene."""
+        return bool(getattr(context.scene, "xmd_active_workflow_id", ""))
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        """Advance the active stack via WorkflowService and persist."""
+        svc = _workflow_service(context)
+        if svc is None:
+            return {"CANCELLED"}
+        stack_id = context.scene.xmd_active_workflow_id
+        before = svc.get(stack_id)
+        if before is None:
+            self.report({"WARNING"}, "Active stack no longer exists")
+            return {"CANCELLED"}
+        if before.current_step >= len(before.steps) - 1:
+            self.report({"INFO"}, "Already at the final step")
+            return {"CANCELLED"}
+        after = svc.advance(stack_id)
+        if after is not None:
+            label = after.steps[after.current_step]
+            diagnostics.info("workflow", f"'{after.name}' advanced → step {after.current_step}: {label}")
+            self.report({"INFO"}, f"Step → {label}")
+        return {"FINISHED"}
+
+
+class BLINQ_OT_workflow_set_step(bpy.types.Operator):
+    """Jump the active workflow stack to a specific step."""
+
+    bl_idname = "blinq.workflow_set_step"
+    bl_label = "Set Step"
+    bl_description = "Jump the active workflow stack to a specific step"
+    bl_options = {"REGISTER", "UNDO"}
+
+    step_index: bpy.props.IntProperty(name="Step", default=0, min=0)  # type: ignore[assignment]
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        return bool(getattr(context.scene, "xmd_active_workflow_id", ""))
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        """Set ``current_step`` directly on the active stack."""
+        svc = _workflow_service(context)
+        if svc is None:
+            return {"CANCELLED"}
+        stack = svc.get(context.scene.xmd_active_workflow_id)
+        if stack is None:
+            return {"CANCELLED"}
+        idx = max(0, min(self.step_index, len(stack.steps) - 1))
+        if stack.current_step == idx:
+            return {"CANCELLED"}
+        stack.current_step = idx
+        svc.save()
+        diagnostics.info("workflow", f"'{stack.name}' jumped → step {idx}: {stack.steps[idx]}")
+        return {"FINISHED"}
+
+
+class BLINQ_OT_workflow_delete(bpy.types.Operator):
+    """Delete the active workflow stack permanently."""
+
+    bl_idname = "blinq.workflow_delete"
+    bl_label = "Delete Workflow Stack"
+    bl_description = "Permanently delete the active workflow stack"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        return bool(getattr(context.scene, "xmd_active_workflow_id", ""))
+
+    def invoke(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
+        """Confirm before deletion."""
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        """Remove the stack from the service and clear the scene reference."""
+        svc = _workflow_service(context)
+        if svc is None:
+            return {"CANCELLED"}
+        stack_id = context.scene.xmd_active_workflow_id
+        stack = svc.get(stack_id)
+        if stack is None:
+            return {"CANCELLED"}
+        # The service has no remove method yet — manage internally.
+        svc._stacks.pop(stack_id, None)  # type: ignore[attr-defined]
+        svc.save()
+        context.scene.xmd_active_workflow_id = ""
+        diagnostics.info("workflow", f"deleted stack '{stack.name}'")
+        self.report({"INFO"}, f"Deleted '{stack.name}'")
+        return {"FINISHED"}
+
+
+class BLINQ_MT_workflow_stacks(bpy.types.Menu):
+    """Dropdown menu listing all workflow stacks for selection."""
+
+    bl_idname = "BLINQ_MT_workflow_stacks"
+    bl_label = "Workflow Stacks"
+
+    def draw(self, context: bpy.types.Context) -> None:
+        """Populate the menu from the WorkflowService at draw time."""
+        layout = self.layout
+        svc = _workflow_service(context)
+        if svc is None:
+            layout.label(text="Set library path first", icon="ERROR")
+            return
+        stacks = svc.all()
+        if not stacks:
+            layout.label(text="No stacks defined", icon="INFO")
+        else:
+            current = getattr(context.scene, "xmd_active_workflow_id", "")
+            for s in stacks:
+                op = layout.operator(
+                    "blinq.workflow_select",
+                    text=s.name,
+                    icon="DOT" if s.id == current else "BLANK1",
+                )
+                op.stack_id = s.id
+            layout.separator()
+            layout.operator("blinq.workflow_clear_active", icon="X")
+        layout.separator()
+        layout.operator("blinq.workflow_create", icon="ADD")
 
 
 class BLINQ_OT_set_retopo_state(bpy.types.Operator):
@@ -906,7 +1150,7 @@ class BLINQ_OT_set_retopo_state(bpy.types.Operator):
                 xmd_uuid = str(obj.get("xmd_uuid", ""))
                 tracker.set_state(xmd_uuid, self.state, asset_name=obj.name)
             except Exception as exc:
-                print(f"[BlinQ] RetopoTracker save error: {exc}")
+                diagnostics.error("workflow", f"retopo tracker save failed: {exc}")
 
         self.report({"INFO"}, f"Retopo state \u2192 {self.state}")
         return {"FINISHED"}
@@ -969,6 +1213,918 @@ class BLINQ_OT_set_retopo_objects(bpy.types.Operator):
 
 
 # ---------------------------------------------------------------------------
+# ── Library audit + batch QC ─────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+class BLINQ_OT_audit_library(bpy.types.Operator):
+    """Audit the XMD library index for orphans, missing UUIDs, and missing files."""
+
+    bl_idname = "blinq.audit_library"
+    bl_label = "Audit Library"
+    bl_description = (
+        "Scan the XMD Library index for missing files, missing UUIDs, "
+        "and broken catalog references. Results in the Diagnostics panel"
+    )
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        return bool(get_prefs(context).library_path)
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        prefs = get_prefs(context)
+        lib_path = Path(prefs.library_path)
+        index = XMDIndex(lib_path)
+        index.load()
+        catalog = CatalogManager(lib_path)
+        catalog.load()
+
+        records = index.all()
+        if not records:
+            self.report({"INFO"}, "Library is empty")
+            return {"FINISHED"}
+
+        missing_uuid = sum(1 for r in records if not r.xmd_uuid)
+        missing_catalog = sum(1 for r in records if not r.catalog_id)
+        unknown_catalog = sum(
+            1 for r in records
+            if r.catalog_id and catalog.path_for_id(r.catalog_id) is None
+        )
+
+        # Check blend_file existence (relative to library)
+        missing_files = 0
+        for r in records:
+            if not r.blend_file:
+                continue
+            candidate = Path(r.blend_file)
+            if not candidate.is_absolute():
+                candidate = lib_path / r.blend_file
+            if not candidate.exists():
+                missing_files += 1
+
+        # Detect duplicate UUIDs (defensive — XMDIndex keys by UUID so dup is unlikely)
+        uuids = [r.xmd_uuid for r in records if r.xmd_uuid]
+        duplicate_uuids = len(uuids) - len(set(uuids))
+
+        diagnostics.info(
+            "audit",
+            f"library audit: {len(records)} records, "
+            f"missing_uuid={missing_uuid}, missing_catalog={missing_catalog}, "
+            f"unknown_catalog={unknown_catalog}, missing_files={missing_files}, "
+            f"duplicate_uuids={duplicate_uuids}",
+        )
+
+        problems = (
+            missing_uuid + missing_catalog + unknown_catalog
+            + missing_files + duplicate_uuids
+        )
+
+        def draw_popup(self_popup, _ctx):
+            layout = self_popup.layout
+            layout.label(text=f"{len(records)} records audited", icon="ASSET_MANAGER")
+            layout.separator()
+            for label, count, icon in (
+                ("Missing UUID",          missing_uuid,      "QUESTION"),
+                ("Missing catalog",       missing_catalog,   "OUTLINER_OB_GROUP_INSTANCE"),
+                ("Unknown catalog ID",    unknown_catalog,   "ERROR"),
+                ("Missing blend file",    missing_files,     "FILE"),
+                ("Duplicate UUID",        duplicate_uuids,   "DUPLICATE"),
+            ):
+                row = layout.row()
+                if count:
+                    row.alert = True
+                row.label(text=f"  {label}: {count}", icon=icon)
+            layout.separator()
+            if problems == 0:
+                layout.label(text="No issues found", icon="CHECKMARK")
+            else:
+                layout.label(text=f"{problems} issue(s) — see Diagnostics", icon="INFO")
+
+        context.window_manager.popup_menu(
+            draw_popup, title="Library Audit", icon="ASSET_MANAGER"
+        )
+        self.report(
+            {"INFO" if problems == 0 else "WARNING"},
+            f"Audit: {problems} issue(s) across {len(records)} records",
+        )
+        return {"FINISHED"}
+
+
+class BLINQ_OT_refresh_all_previews(bpy.types.Operator):
+    """Schedule preview regeneration for every loaded XMD-registered asset."""
+
+    bl_idname = "blinq.refresh_all_previews"
+    bl_label = "Refresh All Previews"
+    bl_description = (
+        "Schedule preview regeneration for every XMD-registered datablock "
+        "currently loaded in this .blend file"
+    )
+    bl_options = {"REGISTER"}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        scheduled = 0
+
+        # Walk the relevant bpy.data collections; if a datablock has an xmd_uuid
+        # custom property AND asset_data, schedule a preview.
+        for coll_name in _TYPE_TO_COLLECTION.values():
+            coll = getattr(bpy.data, coll_name, None)
+            if coll is None:
+                continue
+            for db in coll:
+                if not db.get("xmd_uuid"):
+                    continue
+                if not getattr(db, "asset_data", None):
+                    continue
+                PreviewManager().request_preview(db.name, coll_name)
+                scheduled += 1
+
+        diagnostics.info("preview", f"scheduled {scheduled} preview regeneration(s)")
+        self.report({"INFO"}, f"Scheduled previews for {scheduled} asset(s)")
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
+# ── HDRI loader ──────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+class BLINQ_OT_load_hdri(bpy.types.Operator):
+    """Load an HDRI image and set it as the world environment."""
+
+    bl_idname = "blinq.load_hdri"
+    bl_label = "Load HDRI"
+    bl_description = (
+        "Load an HDR/EXR/image file and wire it into the World shader as "
+        "an environment background"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    filepath: StringProperty(subtype="FILE_PATH", default="")  # type: ignore[assignment]
+    filter_glob: StringProperty(  # type: ignore[assignment]
+        default="*.hdr;*.exr;*.png;*.jpg;*.jpeg;*.tif;*.tiff",
+        options={"HIDDEN"},
+    )
+
+    strength: bpy.props.FloatProperty(  # type: ignore[assignment]
+        name="Strength",
+        description="World background strength multiplier",
+        default=1.0,
+        min=0.0,
+        soft_max=10.0,
+    )
+
+    def invoke(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        if not self.filepath:
+            return {"CANCELLED"}
+
+        path = Path(self.filepath)
+        if not path.is_file():
+            self.report({"ERROR"}, f"File not found: {path}")
+            return {"CANCELLED"}
+
+        try:
+            image = bpy.data.images.load(str(path), check_existing=True)
+        except RuntimeError as exc:
+            self.report({"ERROR"}, f"Could not load image: {exc}")
+            return {"CANCELLED"}
+        # HDRIs and EXRs should not be sRGB-interpreted
+        if path.suffix.lower() in {".hdr", ".exr"}:
+            image.colorspace_settings.name = "Non-Color"
+
+        scene = context.scene
+        world = scene.world or bpy.data.worlds.new("XMD World")
+        scene.world = world
+        world.use_nodes = True
+        tree = world.node_tree
+        tree.nodes.clear()
+
+        # Build: Texture Coord → Mapping → Environment → Background → Output
+        tex_coord = tree.nodes.new("ShaderNodeTexCoord")
+        mapping = tree.nodes.new("ShaderNodeMapping")
+        env = tree.nodes.new("ShaderNodeTexEnvironment")
+        bg = tree.nodes.new("ShaderNodeBackground")
+        out = tree.nodes.new("ShaderNodeOutputWorld")
+
+        env.image = image
+        bg.inputs["Strength"].default_value = float(self.strength)
+
+        tex_coord.location = (-700, 0)
+        mapping.location  = (-500, 0)
+        env.location      = (-250, 0)
+        bg.location       = (   0, 0)
+        out.location      = ( 200, 0)
+
+        tree.links.new(tex_coord.outputs["Generated"], mapping.inputs["Vector"])
+        tree.links.new(mapping.outputs["Vector"], env.inputs["Vector"])
+        tree.links.new(env.outputs["Color"], bg.inputs["Color"])
+        tree.links.new(bg.outputs["Background"], out.inputs["Surface"])
+
+        diagnostics.info("render", f"HDRI loaded: {path.name} (strength={self.strength})")
+        self.report({"INFO"}, f"HDRI: {path.name}")
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
+# ── Render Preset operators ──────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+def _render_preset_service(context: bpy.types.Context):
+    """Return a loaded RenderPresetService, or None."""
+    prefs = get_prefs(context)
+    if not prefs.library_path:
+        return None
+    from ..integrations.render import RenderPresetService
+    svc = RenderPresetService(Path(prefs.library_path))
+    svc.load()
+    return svc
+
+
+class BLINQ_OT_render_preset_save(bpy.types.Operator):
+    """Save the current scene's render settings as a named preset."""
+
+    bl_idname = "blinq.render_preset_save"
+    bl_label = "Save Render Preset"
+    bl_description = "Capture the current scene's render settings as a new preset"
+    bl_options = {"REGISTER", "UNDO"}
+
+    name: StringProperty(name="Preset Name", default="")  # type: ignore[assignment]
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        return bool(get_prefs(context).library_path)
+
+    def invoke(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
+        scene = context.scene
+        engine = scene.render.engine
+        # Suggest a meaningful default name from engine + resolution
+        self.name = f"{engine.replace('BLENDER_', '').title()} {scene.render.resolution_x}x{scene.render.resolution_y}"
+        return context.window_manager.invoke_props_dialog(self, width=320)
+
+    def draw(self, context: bpy.types.Context) -> None:
+        layout = self.layout
+        scene = context.scene
+        layout.prop(self, "name", text="Name")
+        col = layout.column(align=True)
+        col.label(text="Will capture:", icon="INFO")
+        for row_text in (
+            f"  Engine:     {scene.render.engine}",
+            f"  Resolution: {scene.render.resolution_x} × {scene.render.resolution_y}"
+            f" @ {scene.render.resolution_percentage}%",
+            f"  Format:     {scene.render.image_settings.file_format}",
+            f"  Output:     {scene.render.filepath or '(blank)'}",
+            f"  View:       {scene.view_settings.view_transform} / {scene.view_settings.look}",
+        ):
+            row = col.row()
+            row.enabled = False
+            row.label(text=row_text)
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        name = self.name.strip()
+        if not name:
+            self.report({"WARNING"}, "Preset name cannot be empty")
+            return {"CANCELLED"}
+        svc = _render_preset_service(context)
+        if svc is None:
+            self.report({"WARNING"}, "Set the XMD Library Path in Add-on Preferences first")
+            return {"CANCELLED"}
+        preset = svc.add_from_scene(name=name, scene=context.scene)
+        diagnostics.info("render", f"saved preset '{preset.name}' (engine={preset.engine})")
+        self.report({"INFO"}, f"Saved render preset '{preset.name}'")
+        return {"FINISHED"}
+
+
+class BLINQ_OT_render_preset_apply(bpy.types.Operator):
+    """Apply a saved render preset to the current scene."""
+
+    bl_idname = "blinq.render_preset_apply"
+    bl_label = "Apply Render Preset"
+    bl_description = "Apply a saved render preset's settings to the current scene"
+    bl_options = {"REGISTER", "UNDO"}
+
+    preset_id: StringProperty(name="Preset ID", default="")  # type: ignore[assignment]
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        svc = _render_preset_service(context)
+        if svc is None:
+            return {"CANCELLED"}
+        preset = svc.get(self.preset_id)
+        if preset is None:
+            self.report({"WARNING"}, "Preset not found")
+            return {"CANCELLED"}
+        if not svc.apply(self.preset_id, context.scene):
+            return {"CANCELLED"}
+        diagnostics.info("render", f"applied preset '{preset.name}'")
+        self.report({"INFO"}, f"Applied '{preset.name}'")
+        return {"FINISHED"}
+
+
+class BLINQ_OT_render_preset_delete(bpy.types.Operator):
+    """Delete a saved render preset."""
+
+    bl_idname = "blinq.render_preset_delete"
+    bl_label = "Delete Render Preset"
+    bl_description = "Permanently delete this render preset"
+    bl_options = {"REGISTER", "UNDO"}
+
+    preset_id: StringProperty(name="Preset ID", default="")  # type: ignore[assignment]
+
+    def invoke(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        svc = _render_preset_service(context)
+        if svc is None:
+            return {"CANCELLED"}
+        if svc.remove(self.preset_id):
+            diagnostics.info("render", f"deleted preset {self.preset_id[:8]}")
+            return {"FINISHED"}
+        return {"CANCELLED"}
+
+
+# ---------------------------------------------------------------------------
+# ── Random Kit + Challenge generators ────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+class BLINQ_OT_random_kit(bpy.types.Operator):
+    """Pick a random selection of XMD-registered assets for inspiration."""
+
+    bl_idname = "blinq.random_kit"
+    bl_label = "Random Kit"
+    bl_description = (
+        "Sample N random assets from the XMD Library and list them — "
+        "useful when starting a session and feeling stuck"
+    )
+    bl_options = {"REGISTER"}
+
+    count: bpy.props.IntProperty(  # type: ignore[assignment]
+        name="Count",
+        description="How many assets to sample from the library",
+        default=5,
+        min=1,
+        max=20,
+    )
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        return bool(get_prefs(context).library_path)
+
+    def invoke(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
+        return context.window_manager.invoke_props_dialog(self, width=280)
+
+    def draw(self, context: bpy.types.Context) -> None:
+        self.layout.prop(self, "count", slider=True)
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        import random
+        prefs = get_prefs(context)
+        index = XMDIndex(Path(prefs.library_path))
+        index.load()
+        records = index.all()
+        if not records:
+            self.report({"WARNING"}, "Library is empty — register some assets first")
+            return {"CANCELLED"}
+
+        picked = random.sample(records, k=min(self.count, len(records)))
+        names = [r.name for r in picked]
+        diagnostics.info("kit", f"random kit ({len(names)}): {', '.join(names)}")
+
+        # Show as a popup so the user sees the list without opening Diagnostics
+        def draw_popup(self_popup, _ctx):
+            layout = self_popup.layout
+            layout.label(text="Random Kit:", icon="OUTLINER_OB_GROUP_INSTANCE")
+            for r in picked:
+                row = layout.row()
+                row.label(text=f"  {r.name}", icon="DOT")
+                row.label(text=f"({r.asset_type.lower()})")
+        context.window_manager.popup_menu(
+            draw_popup, title="Random Kit", icon="OUTLINER_OB_GROUP_INSTANCE"
+        )
+        self.report({"INFO"}, f"Sampled {len(picked)} asset(s)")
+        return {"FINISHED"}
+
+
+_CHALLENGE_SUBJECTS: tuple[str, ...] = (
+    "ancient warrior", "deep-sea creature", "elder dragon", "forest spirit",
+    "broken android", "alpine herder", "swamp witch", "fungal druid",
+    "cosmic prophet", "shipwreck salvager", "desert nomad", "lichen giant",
+    "miniature mech pilot", "pearl-diver djinn", "post-volcanic gardener",
+    "feral cherub", "scorched gunslinger", "translucent jellyfish wizard",
+)
+_CHALLENGE_STYLES: tuple[str, ...] = (
+    "stylized cartoon", "hyper-realistic", "low-poly retro",
+    "anime/manga", "Studio Ghibli pastel", "soulslike grim",
+    "weighty Pixar volumes", "hand-painted texture", "1990s pre-rendered",
+    "monochrome ink wash", "Saturday-morning toon",
+)
+_CHALLENGE_CONSTRAINTS: tuple[str, ...] = (
+    "in 30 minutes", "with a single symmetrical pose", "with under 10k tris",
+    "using only vertex colors", "in a single material",
+    "with no textures", "with hard-surface only",
+    "using only sculpt brushes", "without booleans",
+    "in two values + one accent color",
+)
+
+
+class BLINQ_OT_random_challenge(bpy.types.Operator):
+    """Generate a random sculpting/modeling challenge prompt."""
+
+    bl_idname = "blinq.random_challenge"
+    bl_label = "New Challenge"
+    bl_description = "Generate a random subject + style + constraint prompt"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        import random
+        subject = random.choice(_CHALLENGE_SUBJECTS)
+        style = random.choice(_CHALLENGE_STYLES)
+        constraint = random.choice(_CHALLENGE_CONSTRAINTS)
+        prompt = f"Sculpt a {subject}, {style}, {constraint}."
+        diagnostics.info("challenge", prompt)
+
+        def draw_popup(self_popup, _ctx):
+            self_popup.layout.label(text=prompt, icon="LIGHT_DATA")
+        context.window_manager.popup_menu(
+            draw_popup, title="Today's Challenge", icon="LIGHT_DATA"
+        )
+        self.report({"INFO"}, prompt)
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
+# ── Reference Board operators ────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+def _reference_service(context: bpy.types.Context):
+    """Return a loaded ReferenceBoardService, or None if no library path is set."""
+    prefs = get_prefs(context)
+    if not prefs.library_path:
+        return None
+    from ..review.service import ReferenceBoardService
+    svc = ReferenceBoardService(Path(prefs.library_path))
+    svc.load()
+    return svc
+
+
+def _snapshot_service(context: bpy.types.Context):
+    """Return a loaded ReviewSnapshotService, or None if no library path is set."""
+    prefs = get_prefs(context)
+    if not prefs.library_path:
+        return None
+    from ..review.service import ReviewSnapshotService
+    svc = ReviewSnapshotService(Path(prefs.library_path))
+    svc.load()
+    return svc
+
+
+class BLINQ_OT_reference_add(bpy.types.Operator):
+    """Add image files to the BlinQ Reference Board."""
+
+    bl_idname = "blinq.reference_add"
+    bl_label = "Add Reference Images"
+    bl_description = "Add one or more image files to the Reference Board"
+    bl_options = {"REGISTER", "UNDO"}
+
+    filepath: StringProperty(subtype="FILE_PATH", default="")  # type: ignore[assignment]
+    files: bpy.props.CollectionProperty(type=bpy.types.OperatorFileListElement)  # type: ignore[assignment]
+    directory: StringProperty(subtype="DIR_PATH", default="")  # type: ignore[assignment]
+    filter_glob: StringProperty(  # type: ignore[assignment]
+        default="*.png;*.jpg;*.jpeg;*.tif;*.tiff;*.exr;*.bmp;*.webp",
+        options={"HIDDEN"},
+    )
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        return bool(get_prefs(context).library_path)
+
+    def invoke(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
+        """Open the file browser."""
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        """Register every selected file and load it as an Image datablock."""
+        svc = _reference_service(context)
+        if svc is None:
+            self.report({"WARNING"}, "Set the XMD Library Path in Add-on Preferences first")
+            return {"CANCELLED"}
+
+        # files[] is populated when multiple are selected; otherwise use filepath
+        chosen: list[str] = []
+        if self.files and self.directory:
+            for f in self.files:
+                if f.name:
+                    chosen.append(str(Path(self.directory) / f.name))
+        elif self.filepath:
+            chosen.append(self.filepath)
+
+        if not chosen:
+            return {"CANCELLED"}
+
+        added = 0
+        for fp in chosen:
+            p = Path(fp)
+            if not p.is_file():
+                continue
+            item = svc.add(file_path=str(p))
+            try:
+                image = bpy.data.images.load(str(p), check_existing=True)
+                svc.update(item.id, image_name=image.name)
+            except RuntimeError as exc:
+                diagnostics.warn("review", f"could not load image '{p.name}': {exc}")
+            added += 1
+            diagnostics.info("review", f"reference added: '{item.name}'")
+
+        if added == 0:
+            self.report({"WARNING"}, "No valid image files selected")
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"Added {added} reference(s)")
+        return {"FINISHED"}
+
+
+class BLINQ_OT_reference_remove(bpy.types.Operator):
+    """Remove a reference image entry from the board."""
+
+    bl_idname = "blinq.reference_remove"
+    bl_label = "Remove Reference"
+    bl_description = "Remove this entry from the Reference Board (does not delete the file)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    ref_id: StringProperty(name="Reference ID", default="")  # type: ignore[assignment]
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        svc = _reference_service(context)
+        if svc is None:
+            return {"CANCELLED"}
+        if svc.remove(self.ref_id):
+            diagnostics.info("review", f"reference removed: {self.ref_id[:8]}")
+            return {"FINISHED"}
+        return {"CANCELLED"}
+
+
+class BLINQ_OT_reference_open(bpy.types.Operator):
+    """Open the reference image in Blender's Image Editor."""
+
+    bl_idname = "blinq.reference_open"
+    bl_label = "Open Reference"
+    bl_description = "Open this reference in the Image Editor"
+    bl_options = {"REGISTER"}
+
+    ref_id: StringProperty(name="Reference ID", default="")  # type: ignore[assignment]
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        svc = _reference_service(context)
+        if svc is None:
+            return {"CANCELLED"}
+        item = svc.get(self.ref_id)
+        if item is None:
+            return {"CANCELLED"}
+
+        # Make sure the image is loaded
+        image = None
+        if item.image_name:
+            image = bpy.data.images.get(item.image_name)
+        if image is None:
+            try:
+                image = bpy.data.images.load(item.file_path, check_existing=True)
+                svc.update(item.id, image_name=image.name)
+            except RuntimeError as exc:
+                self.report({"ERROR"}, f"Could not load image: {exc}")
+                return {"CANCELLED"}
+
+        # Find an Image Editor area or convert the largest non-3D area
+        target_area = None
+        for area in context.screen.areas:
+            if area.type == "IMAGE_EDITOR":
+                target_area = area
+                break
+
+        if target_area is None:
+            self.report(
+                {"WARNING"},
+                f"Loaded '{image.name}' — open an Image Editor to view it",
+            )
+            return {"FINISHED"}
+
+        target_area.spaces.active.image = image
+        target_area.tag_redraw()
+        self.report({"INFO"}, f"Opened '{image.name}' in the Image Editor")
+        return {"FINISHED"}
+
+
+class BLINQ_OT_reference_clear_all(bpy.types.Operator):
+    """Clear all reference entries from the board."""
+
+    bl_idname = "blinq.reference_clear_all"
+    bl_label = "Clear All References"
+    bl_description = "Remove every entry from the Reference Board"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def invoke(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        svc = _reference_service(context)
+        if svc is None:
+            return {"CANCELLED"}
+        ids = [r.id for r in svc.all()]
+        for ref_id in ids:
+            svc.remove(ref_id)
+        diagnostics.info("review", f"reference board cleared ({len(ids)} item(s))")
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
+# ── Review Snapshot operators ────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+class BLINQ_OT_snapshot_capture(bpy.types.Operator):
+    """Capture the active 3D Viewport to a PNG and register it as a snapshot."""
+
+    bl_idname = "blinq.snapshot_capture"
+    bl_label = "Capture Viewport"
+    bl_description = (
+        "Save a PNG of the active 3D Viewport into the library snapshots/ folder "
+        "and register it as a Review Snapshot"
+    )
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        return bool(get_prefs(context).library_path) and any(
+            a.type == "VIEW_3D" for a in context.screen.areas
+        )
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        from datetime import datetime as _dt
+        from ..models import ReviewSnapshot
+
+        svc = _snapshot_service(context)
+        if svc is None:
+            self.report({"WARNING"}, "Set the XMD Library Path in Add-on Preferences first")
+            return {"CANCELLED"}
+
+        svc.ensure_dirs()
+        ts_label = _dt.now().strftime("%Y%m%d-%H%M%S")
+        snap_name = f"viewport-{ts_label}"
+        out_path = svc.snapshot_dir / f"{snap_name}.png"
+
+        # Use bpy.ops.screen.screenshot_area on the largest VIEW_3D
+        target_area = None
+        target_area_size = 0
+        for area in context.screen.areas:
+            if area.type == "VIEW_3D":
+                size = area.width * area.height
+                if size > target_area_size:
+                    target_area_size = size
+                    target_area = area
+        if target_area is None:
+            self.report({"WARNING"}, "No 3D Viewport to capture")
+            return {"CANCELLED"}
+
+        try:
+            with context.temp_override(area=target_area):
+                bpy.ops.screen.screenshot_area(filepath=str(out_path))
+        except Exception as exc:
+            diagnostics.error("review", f"snapshot capture failed: {exc}")
+            self.report({"ERROR"}, f"Capture failed: {exc}")
+            return {"CANCELLED"}
+
+        snap = ReviewSnapshot(
+            name=snap_name,
+            file_path=str(out_path),
+            kind="viewport",
+            scene_name=context.scene.name,
+            camera_name=context.scene.camera.name if context.scene.camera else "",
+        )
+        svc.add(snap)
+        diagnostics.info("review", f"viewport snapshot captured: {out_path.name}")
+        self.report({"INFO"}, f"Snapshot saved: {out_path.name}")
+        return {"FINISHED"}
+
+
+class BLINQ_OT_snapshot_remove(bpy.types.Operator):
+    """Remove a snapshot from the index (the PNG file is left in place)."""
+
+    bl_idname = "blinq.snapshot_remove"
+    bl_label = "Remove Snapshot"
+    bl_description = "Remove this snapshot from the index (does not delete the PNG)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    snap_id: StringProperty(name="Snapshot ID", default="")  # type: ignore[assignment]
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        svc = _snapshot_service(context)
+        if svc is None:
+            return {"CANCELLED"}
+        if svc.remove(self.snap_id):
+            diagnostics.info("review", f"snapshot removed from index: {self.snap_id[:8]}")
+            return {"FINISHED"}
+        return {"CANCELLED"}
+
+
+class BLINQ_OT_snapshot_open(bpy.types.Operator):
+    """Open a snapshot's PNG in the system image viewer."""
+
+    bl_idname = "blinq.snapshot_open"
+    bl_label = "Open Snapshot"
+    bl_description = "Open this snapshot's PNG in the system image viewer"
+    bl_options = {"REGISTER"}
+
+    snap_id: StringProperty(name="Snapshot ID", default="")  # type: ignore[assignment]
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        svc = _snapshot_service(context)
+        if svc is None:
+            return {"CANCELLED"}
+        snap = svc.get(self.snap_id)
+        if snap is None or not snap.file_path:
+            return {"CANCELLED"}
+        try:
+            bpy.ops.wm.path_open(filepath=snap.file_path)
+        except Exception as exc:
+            self.report({"ERROR"}, f"Could not open: {exc}")
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
+# ── Bridge self-test ─────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+class BLINQ_OT_bridge_self_test(bpy.types.Operator):
+    """Send a PING through the bridge transport and verify the round-trip."""
+
+    bl_idname = "blinq.bridge_self_test"
+    bl_label = "Bridge Self-Test"
+    bl_description = (
+        "Write a fake XMD Desktop heartbeat and a PING command, "
+        "then verify BlinQ writes a valid ack within 4 seconds. "
+        "Results appear in the Diagnostics panel"
+    )
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        """Enable only when a bridge work directory is configured."""
+        return bool(getattr(get_prefs(context), "work_dir", ""))
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        """Drive the IPC layer through one full PING round-trip.
+
+        Args:
+            context: The current Blender context.
+
+        Returns:
+            Blender operator result set. Always FINISHED — actual pass/fail is
+            reported asynchronously to the diagnostics log.
+        """
+        import json
+        import time as _time
+        import uuid
+
+        prefs = get_prefs(context)
+        from ..bridge.ipc import IPCTransport, CommandEnvelope
+        from ..models import BridgeCommandType
+
+        work_dir = Path(prefs.work_dir)
+        try:
+            transport = IPCTransport(work_dir)
+        except OSError as exc:
+            self.report({"ERROR"}, f"Cannot prepare work dir: {exc}")
+            return {"CANCELLED"}
+
+        cmd_id = str(uuid.uuid4())
+        ack_path = transport.work_dir / IPCTransport.BLINQ_ACK
+        # Capture the existing ack mtime so we can tell whether the bridge
+        # has actually rewritten the file (vs an old ack still on disk).
+        baseline_mtime = ack_path.stat().st_mtime if ack_path.exists() else 0.0
+
+        # 1) Write a fake XMD Desktop heartbeat so the bridge counts as connected.
+        xmd_alive_path = transport.work_dir / IPCTransport.XMD_ALIVE
+        try:
+            xmd_alive_path.write_text(
+                json.dumps({
+                    "app": "blinq.self-test",
+                    "version": "0.0.0",
+                    "ts": _time.time(),
+                }),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            self.report({"ERROR"}, f"Failed to write fake heartbeat: {exc}")
+            return {"CANCELLED"}
+
+        # 2) Write the PING command for the heartbeat poll to pick up.
+        transport.write_command(
+            CommandEnvelope(id=cmd_id, command=BridgeCommandType.PING.value)
+        )
+        diagnostics.info("bridge", f"self-test: wrote PING id={cmd_id[:8]}")
+
+        # 3) Schedule a check after a few poll cycles. The default poll interval
+        #    is 2 s; 4 s gives us roughly two ticks of margin.
+        def _verify_ack() -> None:
+            try:
+                if not ack_path.exists():
+                    diagnostics.error("bridge", "self-test FAIL: no ack file written")
+                    return
+                if ack_path.stat().st_mtime <= baseline_mtime:
+                    diagnostics.error(
+                        "bridge",
+                        "self-test FAIL: ack file was not rewritten by the bridge",
+                    )
+                    return
+                data = json.loads(ack_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                diagnostics.error("bridge", f"self-test FAIL: bad ack: {exc}")
+                return
+
+            if data.get("id") != cmd_id:
+                diagnostics.error(
+                    "bridge",
+                    f"self-test FAIL: ack id mismatch "
+                    f"(got {str(data.get('id'))[:8]}, expected {cmd_id[:8]})",
+                )
+                return
+            if data.get("status") != "ok":
+                diagnostics.error(
+                    "bridge",
+                    f"self-test FAIL: status={data.get('status')!r} error={data.get('error')!r}",
+                )
+                return
+            if not data.get("result", {}).get("pong"):
+                diagnostics.error("bridge", "self-test FAIL: missing pong in result")
+                return
+
+            diagnostics.info("bridge", f"self-test PASS: PING/ACK round-trip OK ({cmd_id[:8]})")
+
+        bpy.app.timers.register(_verify_ack, first_interval=4.0)
+        self.report(
+            {"INFO"},
+            "Bridge self-test started — result will appear in the Diagnostics panel within 4 s",
+        )
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
+# ── Diagnostics operators ────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+class BLINQ_OT_clear_log(bpy.types.Operator):
+    """Clear the BlinQ diagnostics log buffer."""
+
+    bl_idname = "blinq.clear_log"
+    bl_label = "Clear Log"
+    bl_description = "Empty the BlinQ diagnostics log buffer"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        """Empty the log ring buffer.
+
+        Args:
+            context: The current Blender context.
+
+        Returns:
+            Blender operator result set.
+        """
+        diagnostics.clear()
+        # Tag area redraws so the panel updates immediately
+        for area in context.screen.areas:
+            if area.type == "VIEW_3D":
+                area.tag_redraw()
+        return {"FINISHED"}
+
+
+class BLINQ_OT_copy_log(bpy.types.Operator):
+    """Copy the BlinQ diagnostics log to the clipboard for sharing."""
+
+    bl_idname = "blinq.copy_log"
+    bl_label = "Copy Log"
+    bl_description = "Copy the entire BlinQ diagnostics log to the clipboard"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        """Write the formatted log to ``window_manager.clipboard``.
+
+        Args:
+            context: The current Blender context.
+
+        Returns:
+            Blender operator result set.
+        """
+        text = diagnostics.to_text()
+        if not text:
+            self.report({"INFO"}, "Log is empty")
+            return {"CANCELLED"}
+        context.window_manager.clipboard = text
+        line_count = text.count("\n") + 1
+        self.report({"INFO"}, f"Copied {line_count} log line(s) to clipboard")
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
 # ── Pie menu ─────────────────────────────────────────────────────────────
 # ---------------------------------------------------------------------------
 
@@ -981,28 +2137,28 @@ class BLINQ_MT_pie_menu(bpy.types.Menu):
     def draw(self, context: bpy.types.Context) -> None:
         """Draw the 8-slot pie menu.
 
-        Slot order: W, E, S, N, NW, NE, SW, SE
+        Slot order in Blender's menu_pie: W, E, S, N, NW, NE, SW, SE.
 
         Args:
             context: The current Blender context.
         """
         pie = self.layout.menu_pie()
-        # W — Send Mesh
+        # W — Send Mesh → ZBrush
         pie.operator("blinq.send_mesh", icon="EXPORT")
-        # E — Receive Mesh
+        # E — Receive Mesh ← ZBrush
         pie.operator("blinq.receive_mesh", icon="IMPORT")
-        # S — Register in XMD
-        pie.operator("blinq.register_asset", icon="ADD")
-        # N — Open Library
-        pie.operator("blinq.open_library", icon="FOLDER_REDIRECT")
-        # NW — Send Texture
+        # S — Capture Snapshot
+        pie.operator("blinq.snapshot_capture", icon="CAMERA_DATA")
+        # N — New Challenge
+        pie.operator("blinq.random_challenge", icon="LIGHT_DATA")
+        # NW — Send Texture → ZBrush
         pie.operator("blinq.send_texture", icon="IMAGE_DATA")
-        # NE — Sync Preview
-        pie.operator("blinq.sync_preview", icon="FILE_REFRESH")
-        # SW — Push Metadata
-        pie.operator("blinq.push_metadata", icon="EXPORT")
-        # SE — Refresh Library
-        pie.operator("blinq.refresh_library", icon="FILE_REFRESH")
+        # NE — Random Kit
+        pie.operator("blinq.random_kit", icon="OUTLINER_OB_GROUP_INSTANCE")
+        # SW — Register in XMD
+        pie.operator("blinq.register_asset", icon="ADD")
+        # SE — Open Library
+        pie.operator("blinq.open_library", icon="FOLDER_REDIRECT")
 
 
 class BLINQ_OT_call_pie(bpy.types.Operator):
@@ -1100,6 +2256,40 @@ _CLASSES = [
     # Auth
     BLINQ_OT_sign_in,
     BLINQ_OT_sign_out,
+    # Bridge self-test
+    BLINQ_OT_bridge_self_test,
+    # Workflow
+    BLINQ_OT_workflow_create,
+    BLINQ_OT_workflow_select,
+    BLINQ_OT_workflow_clear_active,
+    BLINQ_OT_workflow_advance,
+    BLINQ_OT_workflow_set_step,
+    BLINQ_OT_workflow_delete,
+    BLINQ_MT_workflow_stacks,
+    # Reference board
+    BLINQ_OT_reference_add,
+    BLINQ_OT_reference_remove,
+    BLINQ_OT_reference_open,
+    BLINQ_OT_reference_clear_all,
+    # Review snapshots
+    BLINQ_OT_snapshot_capture,
+    BLINQ_OT_snapshot_remove,
+    BLINQ_OT_snapshot_open,
+    # Generators
+    BLINQ_OT_random_kit,
+    BLINQ_OT_random_challenge,
+    # Render presets
+    BLINQ_OT_render_preset_save,
+    BLINQ_OT_render_preset_apply,
+    BLINQ_OT_render_preset_delete,
+    # Library QC
+    BLINQ_OT_audit_library,
+    BLINQ_OT_refresh_all_previews,
+    # World / HDRI
+    BLINQ_OT_load_hdri,
+    # Diagnostics
+    BLINQ_OT_clear_log,
+    BLINQ_OT_copy_log,
     # Pie
     BLINQ_MT_pie_menu,
     BLINQ_OT_call_pie,
@@ -1107,13 +2297,21 @@ _CLASSES = [
 
 
 def register() -> None:
-    """Register operator/menu classes, Asset Browser menu, and keymap."""
+    """Register operator/menu classes, Asset Browser menu, scene props, and keymap."""
     for cls in _CLASSES:
         bpy.utils.register_class(cls)
+
+    # Per-scene state
+    bpy.types.Scene.xmd_active_workflow_id = StringProperty(
+        name="XMD Active Workflow",
+        description="UUID of the currently active BlinQ workflow stack",
+        default="",
+    )
+
     try:
         bpy.types.ASSETBROWSER_MT_context_menu.append(_asset_browser_menu)
     except AttributeError:
-        print("[BlinQ] ASSETBROWSER_MT_context_menu not found — Asset Browser menu skipped")
+        diagnostics.warn("ui", "ASSETBROWSER_MT_context_menu not found — Asset Browser menu skipped")
     _add_keymap()
 
 
@@ -1124,5 +2322,11 @@ def unregister() -> None:
         bpy.types.ASSETBROWSER_MT_context_menu.remove(_asset_browser_menu)
     except AttributeError:
         pass
+
+    try:
+        del bpy.types.Scene.xmd_active_workflow_id
+    except AttributeError:
+        pass
+
     for cls in reversed(_CLASSES):
         bpy.utils.unregister_class(cls)

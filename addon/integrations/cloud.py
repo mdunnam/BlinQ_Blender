@@ -498,6 +498,38 @@ class CloudClient:
             self._clear_runtime_state(clear_entitlement=False)
         return ok, msg
 
+    def resolve_activation_status(self, sync_ok: bool, sync_msg: str) -> str:
+        """Translate a sync_runtime_license outcome into an activation_status enum.
+
+        Centralises the mapping so sign-in, refresh, and startup checks all agree.
+
+        Args:
+            sync_ok: Whether the sync_runtime_license call returned success.
+            sync_msg: The message returned by sync_runtime_license. Used to
+                detect transient outages and expired-token states.
+
+        Returns:
+            One of ``"ACTIVE"``, ``"OFFLINE"``, ``"NO_ACCESS"``, ``"EXPIRED"``,
+            ``"UNLICENSED"``.
+        """
+        state = self.runtime_license_state()
+        product_id = state.get("product_id")
+
+        if sync_ok and product_id:
+            return "OFFLINE" if state.get("cached_grace_active") and not state.get("is_logged_in") else "ACTIVE"
+        if sync_ok:
+            return "NO_ACCESS"
+
+        # sync failed — see if cached grace covers a transient outage
+        cached_ok, _ = self.cached_runtime_access_status(sync_msg or "")
+        if cached_ok:
+            return "OFFLINE"
+
+        msg_lower = (sync_msg or "").lower()
+        if "expired" in msg_lower:
+            return "EXPIRED"
+        return "UNLICENSED"
+
     # ------------------------------------------------------------------ runtime state
 
     def runtime_license_state(self) -> dict[str, Any]:

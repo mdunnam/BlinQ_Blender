@@ -12,11 +12,13 @@ Six panels under the "XMD" tab:
 
 from __future__ import annotations
 
+import datetime
 import time
 from pathlib import Path
 
 import bpy
 
+from .. import diagnostics
 from ..assets.index import XMDIndex
 from ..prefs import ADDON_ID
 from ..models import RetopoState
@@ -263,6 +265,8 @@ class BLINQ_PT_bridge(bpy.types.Panel):
         col.operator("blinq.send_texture", icon="IMAGE_DATA")
 
         layout.separator(factor=0.3)
+        row = layout.row(align=True)
+        row.operator("blinq.bridge_self_test", icon="PLAY", text="Self-Test")
         layout.label(
             text="Press Shift+X for the quick pie menu",
             icon="INFO",
@@ -324,6 +328,13 @@ class BLINQ_PT_library(bpy.types.Panel):
             icon="CHECKMARK" if count > 0 else ("INFO" if count == 0 else "ERROR"),
         )
         row.operator("blinq.refresh_library", text="", icon="FILE_REFRESH")
+
+        layout.separator(factor=0.5)
+        # Batch QC + world tools
+        row = layout.row(align=True)
+        row.operator("blinq.audit_library", icon="VIEWZOOM", text="Audit")
+        row.operator("blinq.refresh_all_previews", icon="FILE_REFRESH", text="All Previews")
+        layout.operator("blinq.load_hdri", icon="WORLD_DATA", text="Load HDRI\u2026")
 
         layout.separator(factor=0.5)
         col = layout.column(align=True)
@@ -574,6 +585,405 @@ class BLINQ_PT_retopo(bpy.types.Panel):
 
 
 # ---------------------------------------------------------------------------
+# Panel 6 — Workflow
+# ---------------------------------------------------------------------------
+
+class BLINQ_PT_workflow(bpy.types.Panel):
+    """Active workflow stack with step navigation."""
+
+    bl_label = "Workflow"
+    bl_idname = "BLINQ_PT_workflow"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "XMD"
+    bl_order = 5
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw_header(self, context: bpy.types.Context) -> None:
+        """Show the workflow icon and step counter when a stack is active."""
+        active_id = getattr(context.scene, "xmd_active_workflow_id", "")
+        self.layout.label(text="", icon="SEQUENCE" if active_id else "BLANK1")
+
+    def draw(self, context: bpy.types.Context) -> None:
+        """Render either the picker (no active stack) or the step list."""
+        layout = self.layout
+        prefs = get_prefs(context)
+
+        if not prefs.library_path:
+            row = layout.row()
+            row.alert = True
+            row.label(text="No library path set", icon="ERROR")
+            return
+
+        active_id = getattr(context.scene, "xmd_active_workflow_id", "")
+        from ..workflow.service import WorkflowService
+        svc = WorkflowService(Path(prefs.library_path))
+        svc.load()
+        stack = svc.get(active_id) if active_id else None
+
+        # Picker row — always visible
+        row = layout.row(align=True)
+        row.menu(
+            "BLINQ_MT_workflow_stacks",
+            text=stack.name if stack else "Select Stack…",
+            icon="SEQUENCE",
+        )
+        row.operator("blinq.workflow_create", text="", icon="ADD")
+
+        if stack is None:
+            stacks = svc.all()
+            if stacks:
+                layout.label(text=f"{len(stacks)} stack(s) available", icon="INFO")
+            else:
+                layout.label(text="No stacks yet — click + to create one", icon="INFO")
+            return
+
+        layout.separator(factor=0.3)
+
+        # Step list with current highlighted
+        col = layout.column(align=True)
+        for i, step_name in enumerate(stack.steps):
+            row = col.row(align=True)
+            is_current = i == stack.current_step
+            is_done = i < stack.current_step
+            icon = "PLAY" if is_current else ("CHECKMARK" if is_done else "DOT")
+            op = row.operator(
+                "blinq.workflow_set_step",
+                text=f"{i + 1}. {step_name}",
+                icon=icon,
+                depress=is_current,
+            )
+            op.step_index = i
+
+        layout.separator(factor=0.3)
+
+        # Action buttons
+        row = layout.row(align=True)
+        sub = row.row(align=True)
+        sub.enabled = stack.current_step < len(stack.steps) - 1
+        sub.scale_y = 1.2
+        sub.operator("blinq.workflow_advance", icon="FORWARD")
+        row.operator("blinq.workflow_delete", text="", icon="TRASH")
+
+
+# ---------------------------------------------------------------------------
+# Panel 7 — Reference Board
+# ---------------------------------------------------------------------------
+
+_MAX_REFS_DRAWN = 12
+
+
+class BLINQ_PT_reference(bpy.types.Panel):
+    """Reference image board — managed list of reference photos."""
+
+    bl_label = "Reference Board"
+    bl_idname = "BLINQ_PT_reference"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "XMD"
+    bl_order = 6
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw_header(self, context: bpy.types.Context) -> None:
+        """Show the count badge in the header when items exist."""
+        prefs = get_prefs(context)
+        if not prefs.library_path:
+            self.layout.label(text="", icon="IMAGE_REFERENCE")
+            return
+        try:
+            from ..review.service import ReferenceBoardService
+            svc = ReferenceBoardService(Path(prefs.library_path))
+            svc.load()
+            count = len(svc.all())
+            self.layout.label(text=str(count) if count else "", icon="IMAGE_REFERENCE")
+        except Exception:
+            self.layout.label(text="", icon="IMAGE_REFERENCE")
+
+    def draw(self, context: bpy.types.Context) -> None:
+        """Render the add/clear row and the list of references."""
+        layout = self.layout
+        prefs = get_prefs(context)
+
+        if not prefs.library_path:
+            row = layout.row()
+            row.alert = True
+            row.label(text="No library path set", icon="ERROR")
+            return
+
+        from ..review.service import ReferenceBoardService
+        svc = ReferenceBoardService(Path(prefs.library_path))
+        svc.load()
+        items = svc.all()
+
+        row = layout.row(align=True)
+        row.scale_y = 1.2
+        row.operator("blinq.reference_add", icon="IMPORT", text="Add References…")
+        sub = row.row(align=True)
+        sub.enabled = len(items) > 0
+        sub.scale_y = 1.2
+        sub.operator("blinq.reference_clear_all", text="", icon="TRASH")
+
+        if not items:
+            layout.label(text="No reference images yet", icon="INFO")
+            return
+
+        col = layout.column(align=True)
+        for ref in items[:_MAX_REFS_DRAWN]:
+            row = col.row(align=True)
+            op_open = row.operator(
+                "blinq.reference_open",
+                text=ref.name,
+                icon="IMAGE_DATA",
+            )
+            op_open.ref_id = ref.id
+            op_rm = row.operator("blinq.reference_remove", text="", icon="X")
+            op_rm.ref_id = ref.id
+
+        if len(items) > _MAX_REFS_DRAWN:
+            layout.label(
+                text=f"… {len(items) - _MAX_REFS_DRAWN} more not shown",
+                icon="INFO",
+            )
+
+
+# ---------------------------------------------------------------------------
+# Panel 8 — Review Snapshots
+# ---------------------------------------------------------------------------
+
+_MAX_SNAPSHOTS_DRAWN = 12
+
+
+class BLINQ_PT_snapshots(bpy.types.Panel):
+    """Review snapshots — viewport captures with one-click open."""
+
+    bl_label = "Snapshots"
+    bl_idname = "BLINQ_PT_snapshots"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "XMD"
+    bl_order = 7
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw_header(self, context: bpy.types.Context) -> None:
+        """Show the count badge in the header."""
+        prefs = get_prefs(context)
+        if not prefs.library_path:
+            self.layout.label(text="", icon="RENDER_RESULT")
+            return
+        try:
+            from ..review.service import ReviewSnapshotService
+            svc = ReviewSnapshotService(Path(prefs.library_path))
+            svc.load()
+            count = len(svc.all())
+            self.layout.label(text=str(count) if count else "", icon="RENDER_RESULT")
+        except Exception:
+            self.layout.label(text="", icon="RENDER_RESULT")
+
+    def draw(self, context: bpy.types.Context) -> None:
+        """Render the capture button and the list of snapshots."""
+        layout = self.layout
+        prefs = get_prefs(context)
+
+        if not prefs.library_path:
+            row = layout.row()
+            row.alert = True
+            row.label(text="No library path set", icon="ERROR")
+            return
+
+        from ..review.service import ReviewSnapshotService
+        svc = ReviewSnapshotService(Path(prefs.library_path))
+        svc.load()
+        items = svc.all()
+
+        row = layout.row(align=True)
+        row.scale_y = 1.2
+        row.operator("blinq.snapshot_capture", icon="CAMERA_DATA", text="Capture Viewport")
+
+        if not items:
+            layout.label(text="No snapshots yet", icon="INFO")
+            return
+
+        # Newest first
+        col = layout.column(align=True)
+        for snap in reversed(items[-_MAX_SNAPSHOTS_DRAWN:]):
+            row = col.row(align=True)
+            op_open = row.operator(
+                "blinq.snapshot_open",
+                text=snap.name,
+                icon="RENDER_RESULT",
+            )
+            op_open.snap_id = snap.id
+            op_rm = row.operator("blinq.snapshot_remove", text="", icon="X")
+            op_rm.snap_id = snap.id
+
+        if len(items) > _MAX_SNAPSHOTS_DRAWN:
+            layout.label(
+                text=f"… {len(items) - _MAX_SNAPSHOTS_DRAWN} earlier not shown",
+                icon="INFO",
+            )
+
+
+# ---------------------------------------------------------------------------
+# Panel 9 — Render Presets
+# ---------------------------------------------------------------------------
+
+_MAX_RENDER_PRESETS_DRAWN = 10
+
+
+class BLINQ_PT_render_presets(bpy.types.Panel):
+    """Render preset library — save and apply named render configurations."""
+
+    bl_label = "Render Presets"
+    bl_idname = "BLINQ_PT_render_presets"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "XMD"
+    bl_order = 8
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw_header(self, context: bpy.types.Context) -> None:
+        """Show preset count badge."""
+        prefs = get_prefs(context)
+        if not prefs.library_path:
+            self.layout.label(text="", icon="OUTPUT")
+            return
+        try:
+            from ..integrations.render import RenderPresetService
+            svc = RenderPresetService(Path(prefs.library_path))
+            svc.load()
+            count = len(svc.all())
+            self.layout.label(text=str(count) if count else "", icon="OUTPUT")
+        except Exception:
+            self.layout.label(text="", icon="OUTPUT")
+
+    def draw(self, context: bpy.types.Context) -> None:
+        layout = self.layout
+        prefs = get_prefs(context)
+
+        if not prefs.library_path:
+            row = layout.row()
+            row.alert = True
+            row.label(text="No library path set", icon="ERROR")
+            return
+
+        from ..integrations.render import RenderPresetService
+        svc = RenderPresetService(Path(prefs.library_path))
+        svc.load()
+        items = svc.all()
+
+        row = layout.row(align=True)
+        row.scale_y = 1.2
+        row.operator("blinq.render_preset_save", icon="ADD", text="Save Current…")
+
+        if not items:
+            layout.label(text="No presets saved yet", icon="INFO")
+            return
+
+        col = layout.column(align=True)
+        for preset in items[:_MAX_RENDER_PRESETS_DRAWN]:
+            row = col.row(align=True)
+            engine_label = preset.engine.replace("BLENDER_", "").lower()
+            op_apply = row.operator(
+                "blinq.render_preset_apply",
+                text=f"{preset.name}  ({engine_label} {preset.resolution_x}×{preset.resolution_y})",
+                icon="PLAY",
+            )
+            op_apply.preset_id = preset.id
+            op_del = row.operator("blinq.render_preset_delete", text="", icon="X")
+            op_del.preset_id = preset.id
+
+        if len(items) > _MAX_RENDER_PRESETS_DRAWN:
+            layout.label(
+                text=f"… {len(items) - _MAX_RENDER_PRESETS_DRAWN} more not shown",
+                icon="INFO",
+            )
+
+
+# ---------------------------------------------------------------------------
+# Panel 10 — Diagnostics
+# ---------------------------------------------------------------------------
+
+_DIAG_LEVEL_ICONS: dict[str, str] = {
+    "DEBUG": "DOT",
+    "INFO":  "INFO",
+    "WARN":  "ERROR",
+    "ERROR": "CANCEL",
+}
+
+_MAX_DIAG_ROWS = 15        # cap rows drawn in the panel
+_MAX_DIAG_MSG_CHARS = 60   # truncate long messages
+
+
+class BLINQ_PT_diagnostics(bpy.types.Panel):
+    """In-app log surface for bridge events, cloud calls, and errors."""
+
+    bl_label = "Diagnostics"
+    bl_idname = "BLINQ_PT_diagnostics"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "XMD"
+    bl_order = 9
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw_header(self, context: bpy.types.Context) -> None:
+        """Show an alert icon when there are unread errors.
+
+        Args:
+            context: The current Blender context.
+        """
+        err_count = diagnostics.count_at_level("ERROR")
+        warn_count = diagnostics.count_at_level("WARN")
+        if err_count:
+            self.layout.label(text=str(err_count), icon="CANCEL")
+        elif warn_count:
+            self.layout.label(text=str(warn_count), icon="ERROR")
+        else:
+            self.layout.label(text="", icon="CONSOLE")
+
+    def draw(self, context: bpy.types.Context) -> None:
+        """Draw the level filter, action buttons, and most recent entries.
+
+        Args:
+            context: The current Blender context.
+        """
+        layout = self.layout
+        prefs = get_prefs(context)
+
+        row = layout.row(align=True)
+        row.prop(prefs, "diagnostics_min_level", text="Level")
+        row.operator("blinq.copy_log", text="", icon="COPYDOWN")
+        row.operator("blinq.clear_log", text="", icon="X")
+
+        items = diagnostics.entries(prefs.diagnostics_min_level)
+        if not items:
+            layout.label(text="No log entries", icon="INFO")
+            return
+
+        # Show the tail — newest entry at the bottom.
+        tail = items[-_MAX_DIAG_ROWS:]
+        col = layout.column(align=True)
+        col.scale_y = 0.85
+        for entry in tail:
+            ts = datetime.datetime.fromtimestamp(entry.timestamp).strftime("%H:%M:%S")
+            msg = entry.message
+            if len(msg) > _MAX_DIAG_MSG_CHARS:
+                msg = msg[: _MAX_DIAG_MSG_CHARS - 1] + "…"
+            row = col.row(align=True)
+            if entry.level == "ERROR":
+                row.alert = True
+            row.label(
+                text=f"{ts} {entry.source}: {msg}",
+                icon=_DIAG_LEVEL_ICONS.get(entry.level, "DOT"),
+            )
+
+        if len(items) > len(tail):
+            layout.label(
+                text=f"… {len(items) - len(tail)} earlier entries (use Copy Log)",
+                icon="INFO",
+            )
+
+
+# ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
@@ -584,6 +994,11 @@ _CLASSES = [
     BLINQ_PT_active_asset,
     BLINQ_PT_metadata,   # must follow its parent BLINQ_PT_active_asset
     BLINQ_PT_retopo,
+    BLINQ_PT_workflow,
+    BLINQ_PT_reference,
+    BLINQ_PT_snapshots,
+    BLINQ_PT_render_presets,
+    BLINQ_PT_diagnostics,
 ]
 
 
