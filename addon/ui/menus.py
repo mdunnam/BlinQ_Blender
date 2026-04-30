@@ -9,9 +9,10 @@ from __future__ import annotations
 from pathlib import Path
 
 import bpy
-from bpy.props import EnumProperty, StringProperty
+from bpy.props import CollectionProperty, EnumProperty, IntProperty, StringProperty
 
 from .. import diagnostics, op_utils, usage
+from .library_gallery import BLINQ_PG_AssetSelection
 from ..assets.index import CatalogManager, MetadataMapper, XMDIndex
 from ..assets.previews import PreviewManager
 from ..models import RetopoState
@@ -336,6 +337,50 @@ class BLINQ_OT_import_asset(bpy.types.Operator):
                 diagnostics.error("asset", f"import failed: {exc}")
                 self.report({"ERROR"}, str(exc))
                 return {"CANCELLED"}
+
+
+class BLINQ_OT_gallery_set_type_filter(bpy.types.Operator):
+    """Set the asset type filter for the gallery."""
+
+    bl_idname = "blinq.gallery_set_type_filter"
+    bl_label = "Filter by Type"
+    bl_options = {"REGISTER"}
+
+    filter_type: bpy.props.StringProperty(  # type: ignore[assignment]
+        name="Filter Type", default=""
+    )
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        """Set the type filter.
+
+        Args:
+            context: The current Blender context.
+
+        Returns:
+            Blender operator result set.
+        """
+        context.scene.xmd_gallery_filter_type = self.filter_type
+        return {"FINISHED"}
+
+
+class BLINQ_OT_gallery_clear_selection(bpy.types.Operator):
+    """Clear the selected asset."""
+
+    bl_idname = "blinq.gallery_clear_selection"
+    bl_label = "Clear Selection"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        """Clear selection.
+
+        Args:
+            context: The current Blender context.
+
+        Returns:
+            Blender operator result set.
+        """
+        context.scene.xmd_selected_asset_uuid = ""
+        return {"FINISHED"}
 
 
 class BLINQ_OT_gallery_select_asset(bpy.types.Operator):
@@ -3276,6 +3321,8 @@ _CLASSES = [
     BLINQ_OT_gallery_delete_asset,
     BLINQ_OT_clear_gallery_search,
     BLINQ_OT_gallery_clear_filters,
+    BLINQ_OT_gallery_set_type_filter,
+    BLINQ_OT_gallery_clear_selection,
     # World / HDRI
     BLINQ_OT_load_hdri,
     # Diagnostics
@@ -3289,6 +3336,9 @@ _CLASSES = [
 
 def register() -> None:
     """Register operator/menu classes, Asset Browser menu, scene props, and keymap."""
+    # Register property group first
+    bpy.utils.register_class(BLINQ_PG_AssetSelection)
+
     for cls in _CLASSES:
         bpy.utils.register_class(cls)
 
@@ -3337,6 +3387,19 @@ def register() -> None:
         default="",
     )
 
+    # Advanced gallery features
+    bpy.types.Scene.xmd_gallery_column_count = IntProperty(
+        name="Gallery Columns",
+        description="Number of columns in asset grid",
+        default=4,
+        min=1,
+        max=8,
+    )
+    bpy.types.Scene.xmd_asset_selections = CollectionProperty(
+        type=BLINQ_PG_AssetSelection,
+        name="Asset Selections",
+    )
+
     try:
         bpy.types.ASSETBROWSER_MT_context_menu.append(_asset_browser_menu)
     except AttributeError:
@@ -3363,6 +3426,8 @@ def unregister() -> None:
         "xmd_selected_asset_uuid",
         "xmd_gallery_search_text",
         "xmd_gallery_filter_type",
+        "xmd_gallery_column_count",
+        "xmd_asset_selections",
     ]:
         try:
             delattr(bpy.types.Scene, prop)
@@ -3371,3 +3436,9 @@ def unregister() -> None:
 
     for cls in reversed(_CLASSES):
         bpy.utils.unregister_class(cls)
+
+    # Unregister property group last
+    try:
+        bpy.utils.unregister_class(BLINQ_PG_AssetSelection)
+    except RuntimeError:
+        pass
