@@ -99,7 +99,7 @@ class BLINQ_PT_library_gallery(bpy.types.Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "XMD"
-    bl_order = 1
+    bl_order = 3
 
     def draw_header(self, context: bpy.types.Context) -> None:
         """Draw the panel header icon."""
