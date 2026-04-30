@@ -1,10 +1,11 @@
 """BlinQ N-panel UI for the 3D View sidebar.
 
-Six panels under the "XMD" tab:
+Panels under the "XMD" tab:
 
 - BLINQ_PT_status        — XMD Cloud activation
 - BLINQ_PT_bridge        — bridge connection + send/receive
 - BLINQ_PT_library       — library path, count, quick actions
+- BLINQ_PT_library_gallery — asset library gallery with filtering and management
 - BLINQ_PT_active_asset  — registration state and actions for the active object
 - BLINQ_PT_metadata      — editable metadata (author, description, tags) [sub-panel]
 - BLINQ_PT_retopo        — retopo workflow state for the active object
@@ -23,6 +24,7 @@ from ..assets.index import XMDIndex
 from ..prefs import ADDON_ID
 from ..models import RetopoState
 from ..prefs import get_prefs
+from .library_gallery import BLINQ_PT_library_gallery
 
 
 # ---------------------------------------------------------------------------
@@ -1076,6 +1078,7 @@ _CLASSES = [
     BLINQ_PT_status,
     BLINQ_PT_bridge,
     BLINQ_PT_library,
+    BLINQ_PT_library_gallery,
     BLINQ_PT_active_asset,
     BLINQ_PT_metadata,   # must follow its parent BLINQ_PT_active_asset
     BLINQ_PT_retopo,

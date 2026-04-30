@@ -338,6 +338,114 @@ class BLINQ_OT_import_asset(bpy.types.Operator):
                 return {"CANCELLED"}
 
 
+class BLINQ_OT_gallery_select_asset(bpy.types.Operator):
+    """Select an asset in the library gallery."""
+
+    bl_idname = "blinq.gallery_select_asset"
+    bl_label = "Select Asset"
+    bl_options = {"REGISTER"}
+
+    asset_uuid: bpy.props.StringProperty(  # type: ignore[assignment]
+        name="Asset UUID", default=""
+    )
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        """Set the selected asset UUID on the scene.
+
+        Args:
+            context: The current Blender context.
+
+        Returns:
+            Blender operator result set.
+        """
+        context.scene.xmd_selected_asset_uuid = self.asset_uuid
+        return {"FINISHED"}
+
+
+class BLINQ_OT_gallery_delete_asset(bpy.types.Operator):
+    """Delete a selected asset from the library."""
+
+    bl_idname = "blinq.gallery_delete_asset"
+    bl_label = "Delete Asset"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        """Delete the selected asset from the library index.
+
+        Args:
+            context: The current Blender context.
+
+        Returns:
+            Blender operator result set.
+        """
+        scene = context.scene
+        uuid_str = scene.xmd_selected_asset_uuid
+        if not uuid_str:
+            self.report({"WARNING"}, "No asset selected")
+            return {"CANCELLED"}
+
+        prefs = get_prefs(context)
+        if not op_utils.ensure_library_path(self, prefs):
+            return {"CANCELLED"}
+
+        with op_utils.safe_execute(self, f"deleting asset {uuid_str[:8]}"):
+            index = XMDIndex(Path(prefs.library_path))
+            index.load()
+            if index.remove(uuid_str):
+                index.save()
+                scene.xmd_selected_asset_uuid = ""
+                diagnostics.info("asset", f"deleted asset: {uuid_str[:8]}")
+                self.report({"INFO"}, "Asset deleted from library")
+                from ..ui.panels import invalidate_library_cache
+                invalidate_library_cache()
+                return {"FINISHED"}
+            else:
+                self.report({"WARNING"}, "Asset not found in library")
+                return {"CANCELLED"}
+
+
+class BLINQ_OT_clear_gallery_search(bpy.types.Operator):
+    """Clear the gallery search field."""
+
+    bl_idname = "blinq.clear_gallery_search"
+    bl_label = "Clear Search"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        """Clear the search text.
+
+        Args:
+            context: The current Blender context.
+
+        Returns:
+            Blender operator result set.
+        """
+        context.scene.xmd_gallery_search_text = ""
+        return {"FINISHED"}
+
+
+class BLINQ_OT_gallery_clear_filters(bpy.types.Operator):
+    """Clear all gallery filters."""
+
+    bl_idname = "blinq.gallery_clear_filters"
+    bl_label = "Clear Filters"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        """Clear all filter settings.
+
+        Args:
+            context: The current Blender context.
+
+        Returns:
+            Blender operator result set.
+        """
+        scene = context.scene
+        scene.xmd_gallery_search_text = ""
+        scene.xmd_gallery_filter_type = ""
+        return {"FINISHED"}
+
+
 class BLINQ_OT_list_library_assets(bpy.types.Operator):
     """List all registered assets in the library."""
 
@@ -3163,6 +3271,11 @@ _CLASSES = [
     BLINQ_OT_audit_library,
     BLINQ_OT_audit_blend_dependencies,
     BLINQ_OT_refresh_all_previews,
+    # Gallery operators
+    BLINQ_OT_gallery_select_asset,
+    BLINQ_OT_gallery_delete_asset,
+    BLINQ_OT_clear_gallery_search,
+    BLINQ_OT_gallery_clear_filters,
     # World / HDRI
     BLINQ_OT_load_hdri,
     # Diagnostics
@@ -3186,6 +3299,44 @@ def register() -> None:
         default="",
     )
 
+    # Gallery viewer state
+    bpy.types.Scene.xmd_gallery_tab = EnumProperty(
+        name="Gallery Tab",
+        description="Current gallery viewer tab",
+        items=[
+            ("GALLERY", "Gallery", "Asset gallery and browsing"),
+            ("FOLDERS", "Folders", "Folder management"),
+        ],
+        default="GALLERY",
+    )
+    bpy.types.Scene.xmd_selected_asset_uuid = StringProperty(
+        name="Selected Asset UUID",
+        description="UUID of the currently selected asset in the gallery",
+        default="",
+    )
+    bpy.types.Scene.xmd_gallery_search_text = StringProperty(
+        name="Search",
+        description="Search text to filter assets by name",
+        default="",
+    )
+    bpy.types.Scene.xmd_gallery_filter_type = EnumProperty(
+        name="Asset Type",
+        description="Filter assets by type",
+        items=[
+            ("", "All Types", ""),
+            ("OBJECT", "Objects", ""),
+            ("MATERIAL", "Materials", ""),
+            ("BRUSH", "Brushes", ""),
+            ("IMAGE", "Images", ""),
+            ("TEXTURE", "Textures", ""),
+            ("NODE_GROUP", "Node Groups", ""),
+            ("COLLECTION", "Collections", ""),
+            ("WORLD", "Worlds", ""),
+            ("SCENE", "Scenes", ""),
+        ],
+        default="",
+    )
+
     try:
         bpy.types.ASSETBROWSER_MT_context_menu.append(_asset_browser_menu)
     except AttributeError:
@@ -3205,6 +3356,18 @@ def unregister() -> None:
         del bpy.types.Scene.xmd_active_workflow_id
     except AttributeError:
         pass
+
+    # Gallery properties
+    for prop in [
+        "xmd_gallery_tab",
+        "xmd_selected_asset_uuid",
+        "xmd_gallery_search_text",
+        "xmd_gallery_filter_type",
+    ]:
+        try:
+            delattr(bpy.types.Scene, prop)
+        except AttributeError:
+            pass
 
     for cls in reversed(_CLASSES):
         bpy.utils.unregister_class(cls)
