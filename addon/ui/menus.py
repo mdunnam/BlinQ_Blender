@@ -338,6 +338,67 @@ class BLINQ_OT_import_asset(bpy.types.Operator):
                 return {"CANCELLED"}
 
 
+class BLINQ_OT_list_library_assets(bpy.types.Operator):
+    """List all registered assets in the library."""
+
+    bl_idname = "blinq.list_library_assets"
+    bl_label = "List Library Assets"
+    bl_description = "Show all registered assets in the XMD Library"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        """List assets to the report and diagnostics log.
+
+        Args:
+            context: The current Blender context.
+
+        Returns:
+            Blender operator result set.
+        """
+        prefs = get_prefs(context)
+        if not op_utils.ensure_library_path(self, prefs):
+            return {"CANCELLED"}
+
+        with op_utils.safe_execute(self, "listing library assets"):
+            index = XMDIndex(Path(prefs.library_path))
+            index.load()
+            assets = index.all()
+
+            if not assets:
+                self.report({"INFO"}, "No assets registered in library")
+                diagnostics.info("asset", "library is empty")
+                return {"FINISHED"}
+
+            # Build output
+            by_type: dict[str, list] = {}
+            for record in assets:
+                key = record.asset_type or "Unknown"
+                if key not in by_type:
+                    by_type[key] = []
+                by_type[key].append(record)
+
+            # Log summary
+            diagnostics.info("asset", f"library contains {len(assets)} asset(s)")
+            for asset_type, records in sorted(by_type.items()):
+                diagnostics.info("asset", f"  {asset_type}: {len(records)}")
+                for record in records[:5]:  # Log first 5 per type
+                    tags_str = ", ".join(record.tags) if record.tags else "(no tags)"
+                    diagnostics.info(
+                        "asset",
+                        f"    • {record.name} — {tags_str}",
+                    )
+                if len(records) > 5:
+                    diagnostics.info("asset", f"    ... and {len(records) - 5} more")
+
+            # Report summary
+            summary_lines = [f"Library contains {len(assets)} asset(s):"]
+            for asset_type, records in sorted(by_type.items()):
+                summary_lines.append(f"  {asset_type}: {len(records)}")
+
+            self.report({"INFO"}, " | ".join(summary_lines))
+            return {"FINISHED"}
+
+
 class BLINQ_OT_import_assets_folder(bpy.types.Operator):
     """Import multiple asset .blend files from a folder into the library."""
 
@@ -3045,6 +3106,7 @@ _CLASSES = [
     BLINQ_OT_import_asset,
     BLINQ_OT_import_assets_folder,
     BLINQ_OT_export_asset_file,
+    BLINQ_OT_list_library_assets,
     BLINQ_OT_push_metadata,
     BLINQ_OT_pull_metadata,
     BLINQ_OT_sync_preview,
