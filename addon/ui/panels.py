@@ -160,6 +160,7 @@ class BLINQ_PT_status(bpy.types.Panel):
             icon=_STATUS_ICONS.get(prefs.activation_status, "QUESTION"),
         )
         row.operator("blinq.check_activation", text="", icon="FILE_REFRESH")
+        row.operator("blinq.check_health", text="", icon="TOOL_SETTINGS")
 
         # Seat / lease info when active
         if prefs.xmdsource_runtime_product_id:

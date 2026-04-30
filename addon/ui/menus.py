@@ -11,7 +11,7 @@ from pathlib import Path
 import bpy
 from bpy.props import EnumProperty, StringProperty
 
-from .. import diagnostics, usage
+from .. import diagnostics, op_utils, usage
 from ..assets.index import CatalogManager, MetadataMapper, XMDIndex
 from ..assets.previews import PreviewManager
 from ..models import RetopoState
@@ -585,6 +585,11 @@ class BLINQ_OT_sign_in(bpy.types.Operator):
             return {"CANCELLED"}
 
         diagnostics.info("cloud", f"signed in as {prefs.xmdsource_display_name or username}")
+        usage.log(
+            prefs.library_path,
+            event="cloud.sign_in",
+            payload={"username": username, "display_name": prefs.xmdsource_display_name},
+        )
 
         # Login succeeded — now sync the runtime license
         ok2, _, msg2 = client.sync_runtime_license()
@@ -655,6 +660,76 @@ class BLINQ_OT_check_activation(bpy.types.Operator):
 
         self.report({"INFO"}, msg)
         return {"FINISHED"}
+
+
+class BLINQ_OT_check_health(bpy.types.Operator):
+    """Validate addon configuration, paths, and connectivity."""
+
+    bl_idname = "blinq.check_health"
+    bl_label = "Check Add-on Health"
+    bl_description = "Validate configuration, paths, and XMD Desktop connectivity"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        """Run configuration and connectivity checks.
+
+        Args:
+            context: The current Blender context.
+
+        Returns:
+            Blender operator result set.
+        """
+        with op_utils.safe_execute(self, "health check"):
+            prefs = get_prefs(context)
+            issues = []
+
+            # Check library path
+            if not prefs.library_path:
+                issues.append("Library Path not configured")
+            else:
+                lib = Path(prefs.library_path)
+                if not lib.exists():
+                    issues.append(f"Library Path does not exist: {lib}")
+                elif not lib.is_dir():
+                    issues.append(f"Library Path is not a directory: {lib}")
+
+            # Check bridge work directory
+            if not prefs.work_dir:
+                issues.append("Bridge Work Directory not configured")
+            else:
+                work = Path(prefs.work_dir)
+                if not work.exists():
+                    issues.append(f"Bridge Work Directory does not exist: {work}")
+                elif not work.is_dir():
+                    issues.append(f"Bridge Work Directory is not a directory: {work}")
+                else:
+                    # Try to verify bridge connectivity
+                    try:
+                        transport = _get_transport(prefs)
+                        if transport:
+                            transport.self_test()
+                            diagnostics.info("health", "bridge connectivity OK")
+                    except Exception as exc:
+                        issues.append(f"Bridge connectivity failed: {exc}")
+
+            # Check cloud activation
+            from ..integrations.cloud import CloudClient
+            client = CloudClient(prefs)
+            if not client.is_logged_in():
+                issues.append("Not signed in to XMDSource")
+            elif not client.has_active_runtime_access():
+                issues.append(f"License inactive: {prefs.activation_status}")
+
+            if issues:
+                msg = " | ".join(issues)
+                diagnostics.warn("health", msg)
+                self.report({"WARNING"}, msg)
+            else:
+                msg = "All checks passed ✓"
+                diagnostics.info("health", msg)
+                self.report({"INFO"}, msg)
+
+            return {"FINISHED"}
 
 
 # ---------------------------------------------------------------------------
@@ -757,6 +832,14 @@ class BLINQ_OT_send_meshes_each(bpy.types.Operator):
                 "bridge",
                 f"sent {result['objects']} object(s) as SubTools "
                 f"({len(result['files'])} file(s))",
+            )
+            blend_file, scene_name = _usage_blend(context)
+            usage.log(
+                prefs.library_path,
+                event="bridge.send_meshes_each",
+                blend_file=blend_file,
+                scene_name=scene_name,
+                payload={"objects": result["objects"], "files": result["files"]},
             )
             self.report(
                 {"INFO"},
@@ -1064,6 +1147,14 @@ class BLINQ_OT_workflow_advance(bpy.types.Operator):
         if after is not None:
             label = after.steps[after.current_step]
             diagnostics.info("workflow", f"'{after.name}' advanced → step {after.current_step}: {label}")
+            blend_file, scene_name = _usage_blend(context)
+            usage.log(
+                get_prefs(context).library_path,
+                event="workflow.advance",
+                blend_file=blend_file,
+                scene_name=scene_name,
+                payload={"stack_name": after.name, "step_index": after.current_step, "step_name": label},
+            )
             self.report({"INFO"}, f"Step → {label}")
         return {"FINISHED"}
 
@@ -1459,6 +1550,14 @@ class BLINQ_OT_light_rig_apply(bpy.types.Operator):
             return {"CANCELLED"}
         created = svc.apply_to_scene(self.rig_id, context.scene, bpy)
         diagnostics.info("render", f"applied rig '{rig.name}': {created} light(s) added")
+        blend_file, scene_name = _usage_blend(context)
+        usage.log(
+            get_prefs(context).library_path,
+            event="render.light_rig_apply",
+            blend_file=blend_file,
+            scene_name=scene_name,
+            payload={"rig_name": rig.name, "lights_created": created},
+        )
         self.report({"INFO"}, f"Added {created} light(s)")
         return {"FINISHED"}
 
@@ -1872,6 +1971,14 @@ class BLINQ_OT_render_preset_apply(bpy.types.Operator):
         if not svc.apply(self.preset_id, context.scene):
             return {"CANCELLED"}
         diagnostics.info("render", f"applied preset '{preset.name}'")
+        blend_file, scene_name = _usage_blend(context)
+        usage.log(
+            get_prefs(context).library_path,
+            event="render.preset_apply",
+            blend_file=blend_file,
+            scene_name=scene_name,
+            payload={"preset_name": preset.name, "engine": preset.engine},
+        )
         self.report({"INFO"}, f"Applied '{preset.name}'")
         return {"FINISHED"}
 
@@ -2604,6 +2711,7 @@ _CLASSES = [
     BLINQ_OT_open_library,
     BLINQ_OT_refresh_library,
     BLINQ_OT_check_activation,
+    BLINQ_OT_check_health,
     # Bridge
     BLINQ_OT_send_mesh,
     BLINQ_OT_send_meshes_each,
