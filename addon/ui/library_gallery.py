@@ -106,12 +106,29 @@ class BLINQ_PT_library_gallery(bpy.types.Panel):
             self._draw_folders(layout, context, prefs)
 
     def _draw_gallery(self, layout, context, all_assets, scene):
-        # ── Row 1: Category filter icons ──────────────────────────────────
-        cat_row = layout.row(align=True)
-        cat_row.scale_x = 1.0
+        filtered = _filter_assets(
+            all_assets,
+            scene.xmd_gallery_search_text,
+            scene.xmd_gallery_filter_type,
+        )
+
+        # ── Main split: left sidebar (icons) | right content ──────────────
+        split = layout.split(factor=0.12)
+
+        # LEFT: vertical category icon column
+        left = split.column(align=True)
+        self._draw_category_sidebar(left, scene)
+
+        # RIGHT: search + grid + detail
+        right = split.column()
+        self._draw_search_and_grid(right, scene, all_assets, filtered)
+
+    def _draw_category_sidebar(self, layout, scene):
+        """Vertical icon-only category buttons."""
+        col = layout.column(align=True)
         for type_id, label, icon in ASSET_CATEGORIES:
             is_active = scene.xmd_gallery_filter_type == type_id
-            op = cat_row.operator(
+            op = col.operator(
                 "blinq.gallery_set_type_filter",
                 text="",
                 icon=icon,
@@ -119,24 +136,20 @@ class BLINQ_PT_library_gallery(bpy.types.Panel):
             )
             op.filter_type = type_id
 
-        # ── Row 2: Search bar ─────────────────────────────────────────────
-        search_row = layout.row(align=True)
-        search_row.prop(scene, "xmd_gallery_search_text", text="", icon="VIEWZOOM")
-        search_row.operator("blinq.clear_gallery_search", text="", icon="X")
+    def _draw_search_and_grid(self, layout, scene, all_assets, filtered):
+        """Search bar, column control, asset grid, and detail panel."""
+        # Search bar
+        row = layout.row(align=True)
+        row.prop(scene, "xmd_gallery_search_text", text="", icon="VIEWZOOM")
+        row.operator("blinq.clear_gallery_search", text="", icon="X")
 
-        # ── Row 3: Column count + count label ─────────────────────────────
-        ctrl_row = layout.row(align=True)
-        ctrl_row.prop(scene, "xmd_gallery_column_count", text="Cols")
-
-        filtered = _filter_assets(
-            all_assets,
-            scene.xmd_gallery_search_text,
-            scene.xmd_gallery_filter_type,
-        )
+        # Cols + count
+        row2 = layout.row(align=True)
+        row2.prop(scene, "xmd_gallery_column_count", text="Cols")
         suffix = f"/{len(all_assets)}" if len(filtered) != len(all_assets) else ""
-        ctrl_row.label(text=f"{len(filtered)}{suffix} assets")
+        row2.label(text=f"{len(filtered)}{suffix} assets")
 
-        # ── Row 4: Asset grid ─────────────────────────────────────────────
+        # Grid
         if not filtered:
             layout.label(text="No assets match filters", icon="INFO")
         else:
@@ -150,7 +163,7 @@ class BLINQ_PT_library_gallery(bpy.types.Panel):
             for asset in filtered:
                 self._draw_card(grid, asset, scene)
 
-        # ── Row 5: Selected asset detail ──────────────────────────────────
+        # Selected asset detail
         if scene.xmd_selected_asset_uuid:
             sel = next(
                 (a for a in all_assets if a.xmd_uuid == scene.xmd_selected_asset_uuid),
@@ -159,7 +172,7 @@ class BLINQ_PT_library_gallery(bpy.types.Panel):
             if sel:
                 self._draw_detail(layout, sel, scene)
 
-        # ── Row 6: Tag cloud for checked assets ───────────────────────────
+        # Tag cloud
         checked = [
             a for a in all_assets
             if _get_or_create_selection(scene, a.xmd_uuid).is_selected
