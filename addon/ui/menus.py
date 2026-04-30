@@ -195,6 +195,149 @@ class BLINQ_OT_register_asset(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class BLINQ_OT_import_asset(bpy.types.Operator):
+    """Import a registered asset from the library into the current blend."""
+
+    bl_idname = "blinq.import_asset"
+    bl_label = "Import Asset from XMD"
+    bl_description = "Import a registered asset from the XMD Library into this blend"
+    bl_options = {"REGISTER", "UNDO"}
+
+    asset_uuid: bpy.props.StringProperty(  # type: ignore[assignment]
+        name="Asset UUID", default=""
+    )
+
+    def invoke(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
+        """Show dialog to enter asset UUID if not set.
+
+        Args:
+            context: The current Blender context.
+            event: The triggering input event.
+
+        Returns:
+            Blender operator result set.
+        """
+        if self.asset_uuid:
+            return self.execute(context)
+        return context.window_manager.invoke_props_dialog(self, width=400)
+
+    def draw(self, context: bpy.types.Context) -> None:
+        """Draw the dialog.
+
+        Args:
+            context: The current Blender context.
+        """
+        layout = self.layout
+        layout.label(text="Enter the XMD UUID of an asset to import", icon="IMPORT")
+        layout.prop(self, "asset_uuid", text="UUID")
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        """Import the asset by UUID.
+
+        Args:
+            context: The current Blender context.
+
+        Returns:
+            Blender operator result set.
+        """
+        uuid_str = self.asset_uuid.strip()
+        if not uuid_str:
+            self.report({"WARNING"}, "Asset UUID cannot be empty")
+            return {"CANCELLED"}
+
+        with op_utils.safe_execute(self, f"importing asset {uuid_str[:8]}"):
+            prefs = get_prefs(context)
+            if not op_utils.ensure_library_path(self, prefs):
+                return {"CANCELLED"}
+
+            index = XMDIndex(Path(prefs.library_path))
+            index.load()
+            record = index.get(uuid_str)
+            if record is None:
+                self.report({"ERROR"}, f"Asset '{uuid_str[:8]}...' not found in library")
+                return {"CANCELLED"}
+
+            if not record.blend_file:
+                self.report({"ERROR"}, f"Asset '{record.name}' has no source blend file")
+                return {"CANCELLED"}
+
+            src_blend = Path(prefs.library_path) / record.blend_file
+            if not src_blend.exists():
+                self.report({"ERROR"}, f"Source file not found: {src_blend}")
+                return {"CANCELLED"}
+
+            # Determine collection to append from
+            type_to_collection = {
+                "Object": "objects",
+                "Material": "materials",
+                "Brush": "brushes",
+                "Image": "images",
+                "Texture": "textures",
+                "Collection": "collections",
+                "World": "worlds",
+            }
+            collection = type_to_collection.get(record.asset_type)
+            if not collection:
+                self.report({"ERROR"}, f"Unsupported asset type: {record.asset_type}")
+                return {"CANCELLED"}
+
+            # Append the datablock from the source blend
+            try:
+                with bpy.data.libraries.load(str(src_blend)) as (data_from, data_to):
+                    items = getattr(data_from, collection, [])
+                    if record.name not in items:
+                        self.report(
+                            {"ERROR"},
+                            f"'{record.name}' not found in {collection} in {src_blend.name}",
+                        )
+                        return {"CANCELLED"}
+                    setattr(data_to, collection, [record.name])
+
+                # Get the newly imported datablock
+                imported = None
+                if collection == "objects":
+                    imported = bpy.data.objects.get(record.name)
+                    if imported:
+                        context.collection.objects.link(imported)
+                elif collection == "materials":
+                    imported = bpy.data.materials.get(record.name)
+                elif collection == "brushes":
+                    imported = bpy.data.brushes.get(record.name)
+                elif collection == "images":
+                    imported = bpy.data.images.get(record.name)
+                elif collection == "worlds":
+                    imported = bpy.data.worlds.get(record.name)
+
+                if imported is None:
+                    self.report({"ERROR"}, f"Failed to import '{record.name}'")
+                    return {"CANCELLED"}
+
+                # Stamp UUID and apply metadata
+                imported["xmd_uuid"] = uuid_str
+                mapper = MetadataMapper()
+                mapper.apply_to_blender(record, imported)
+
+                diagnostics.info(
+                    "asset",
+                    f"imported {record.asset_type.lower()}: {record.name}",
+                )
+                blend_file, scene_name = _usage_blend(context)
+                usage.log(
+                    prefs.library_path,
+                    event="asset.imported",
+                    asset_uuid=uuid_str,
+                    blend_file=blend_file,
+                    scene_name=scene_name,
+                    payload={"name": record.name, "type": record.asset_type},
+                )
+                self.report({"INFO"}, f"Imported: {record.name}")
+                return {"FINISHED"}
+            except Exception as exc:
+                diagnostics.error("asset", f"import failed: {exc}")
+                self.report({"ERROR"}, str(exc))
+                return {"CANCELLED"}
+
+
 class BLINQ_OT_push_metadata(bpy.types.Operator):
     """Push current Blender metadata for the active datablock into the XMD Library index."""
 
@@ -2703,6 +2846,7 @@ def _remove_keymap() -> None:
 
 _CLASSES = [
     BLINQ_OT_register_asset,
+    BLINQ_OT_import_asset,
     BLINQ_OT_push_metadata,
     BLINQ_OT_pull_metadata,
     BLINQ_OT_sync_preview,
