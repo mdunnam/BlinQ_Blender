@@ -113,7 +113,7 @@ class BLINQ_PT_library_gallery(bpy.types.Panel):
         )
 
         # ── Main split: left sidebar (icons) | right content ──────────────
-        split = layout.split(factor=0.12)
+        split = layout.split(factor=0.08)
 
         # LEFT: vertical category icon column
         left = split.column(align=True)
