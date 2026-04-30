@@ -81,6 +81,84 @@ class MeshExporter:
 
         return {"file": filename, "objects": len(selected), "uuids": uuids}
 
+    def execute_per_object(self) -> dict[str, Any]:
+        """Export each selected mesh as its own OBJ — multi-SubTool style.
+
+        ZBrush represents each SubTool as an independent mesh, so a per-object
+        export gives the cleanest hand-off when the artist intends each
+        Blender object to land as a separate SubTool on the other side.
+
+        Steps:
+            1. Collect all selected MESH-type objects.
+            2. For each, deselect-others / select-this and export to a
+               uniquely named OBJ in mesh_out/.
+            3. Stamp ``xmd_uuid`` if absent.
+            4. Write a single ``receive_mesh`` command listing every file.
+
+        Returns:
+            A dict with keys ``files`` (list of filenames), ``objects``
+            (count), and ``uuids`` (mapping of object name to UUID).
+
+        Raises:
+            RuntimeError: If no mesh objects are selected.
+        """
+        selected = [o for o in bpy.context.selected_objects if o.type == "MESH"]
+        if not selected:
+            raise RuntimeError("No mesh objects selected for export")
+
+        job_id = str(uuid.uuid4())[:8]
+        files: list[dict[str, str]] = []
+        uuids: dict[str, str] = {}
+
+        # Preserve the original selection so we can restore it
+        prior_selection = list(bpy.context.selected_objects)
+        prior_active = bpy.context.view_layer.objects.active
+        try:
+            for obj in selected:
+                xmd_uuid = str(obj.get("xmd_uuid", ""))
+                if not xmd_uuid:
+                    xmd_uuid = str(uuid.uuid4())
+                    obj["xmd_uuid"] = xmd_uuid
+                uuids[obj.name] = xmd_uuid
+
+                bpy.ops.object.select_all(action="DESELECT")
+                obj.select_set(True)
+                bpy.context.view_layer.objects.active = obj
+
+                # Slug-safe filename derived from the object name
+                slug = "".join(c if c.isalnum() or c in "-_" else "_" for c in obj.name)
+                filename = f"export_{job_id}_{slug}.obj"
+                out_path = self._t.mesh_out_dir / filename
+
+                bpy.ops.wm.obj_export(
+                    filepath=str(out_path),
+                    check_existing=False,
+                    export_selected_objects=True,
+                    export_materials=False,
+                    export_uv=True,
+                    export_normals=True,
+                )
+                files.append({"file": filename, "object": obj.name, "uuid": xmd_uuid})
+        finally:
+            bpy.ops.object.select_all(action="DESELECT")
+            for o in prior_selection:
+                try:
+                    o.select_set(True)
+                except RuntimeError:
+                    pass
+            if prior_active is not None:
+                bpy.context.view_layer.objects.active = prior_active
+
+        self._t.write_command(
+            CommandEnvelope(
+                id=job_id,
+                command=BridgeCommandType.RECEIVE_MESH.value,
+                payload={"files": files, "mode": "subtools"},
+            )
+        )
+
+        return {"files": [f["file"] for f in files], "objects": len(files), "uuids": uuids}
+
 
 class MeshImporter:
     """Imports an OBJ file from the bridge mesh_in directory into the scene.

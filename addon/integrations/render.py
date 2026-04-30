@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import diagnostics
-from ..models import RenderPreset
+from ..models import LightInfo, LightRig, RenderPreset
 
 
 # ---------------------------------------------------------------------------
@@ -196,3 +196,155 @@ class RenderPresetService:
         if preset.samples:
             _write_samples(scene, preset.samples)
         return True
+
+
+# ---------------------------------------------------------------------------
+# LightRigService
+# ---------------------------------------------------------------------------
+
+def _light_size(light_data: Any) -> float:
+    """Return the relevant size attribute for a light datablock.
+
+    Args:
+        light_data: A ``bpy.types.Light`` datablock.
+
+    Returns:
+        Cone size (SPOT) or area size, defaulting to 0.0 for POINT/SUN.
+    """
+    light_type = getattr(light_data, "type", "POINT")
+    if light_type == "SPOT":
+        return float(getattr(light_data, "spot_size", 0.0))
+    if light_type == "AREA":
+        return float(getattr(light_data, "size", 0.0))
+    return 0.0
+
+
+class LightRigService:
+    """Persist and recreate named light setups in the BlinQ library.
+
+    Storage: ``{library_path}/xmd_light_rigs.json``.
+
+    Args:
+        library_path: Absolute path to the XMD library root folder.
+    """
+
+    FILENAME = "xmd_light_rigs.json"
+
+    def __init__(self, library_path: Path) -> None:
+        self._dir = library_path
+        self._items: dict[str, LightRig] = {}
+
+    @property
+    def file_path(self) -> Path:
+        """Absolute path to the JSON file."""
+        return self._dir / self.FILENAME
+
+    def load(self) -> None:
+        """Load rigs from disk. Missing file starts empty."""
+        self._items = {}
+        if not self.file_path.exists():
+            return
+        try:
+            data = json.loads(self.file_path.read_text(encoding="utf-8"))
+            for entry in data.get("items", []):
+                rig = LightRig.from_dict(entry)
+                if rig.id:
+                    self._items[rig.id] = rig
+        except (json.JSONDecodeError, OSError, KeyError) as exc:
+            diagnostics.error("render", f"failed to load light rigs: {exc}")
+
+    def save(self) -> None:
+        """Persist rigs to disk."""
+        self._dir.mkdir(parents=True, exist_ok=True)
+        self.file_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "1",
+                    "saved_at": datetime.now(timezone.utc).isoformat(),
+                    "items": [r.to_dict() for r in self._items.values()],
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+    def all(self) -> list[LightRig]:
+        """Return all rigs, oldest first."""
+        return list(self._items.values())
+
+    def get(self, rig_id: str) -> LightRig | None:
+        """Return a rig by ID, or None."""
+        return self._items.get(rig_id)
+
+    def remove(self, rig_id: str) -> bool:
+        """Remove a rig by ID. Persists on success."""
+        if rig_id in self._items:
+            del self._items[rig_id]
+            self.save()
+            return True
+        return False
+
+    def capture_from_scene(self, name: str, scene: Any) -> LightRig:
+        """Snapshot every LIGHT-type object in ``scene`` into a new rig.
+
+        Args:
+            name: Display name for the rig.
+            scene: A ``bpy.types.Scene`` whose lights should be captured.
+
+        Returns:
+            The newly created LightRig.
+        """
+        infos: list[LightInfo] = []
+        for obj in scene.objects:
+            if obj.type != "LIGHT":
+                continue
+            data = obj.data
+            infos.append(
+                LightInfo(
+                    name=obj.name,
+                    type=getattr(data, "type", "POINT"),
+                    location=list(obj.location),
+                    rotation_euler=list(obj.rotation_euler),
+                    energy=float(getattr(data, "energy", 1000.0)),
+                    color=list(getattr(data, "color", (1.0, 1.0, 1.0))),
+                    size=_light_size(data),
+                )
+            )
+        rig = LightRig(name=name, lights=infos)
+        self._items[rig.id] = rig
+        self.save()
+        return rig
+
+    def apply_to_scene(self, rig_id: str, scene: Any, bpy_module: Any) -> int:
+        """Recreate the rig's lights inside a scene.
+
+        Args:
+            rig_id: The rig UUID.
+            scene: A ``bpy.types.Scene`` to add lights to.
+            bpy_module: Reference to ``bpy`` (passed in to keep the service bpy-free).
+
+        Returns:
+            The count of lights created. Returns 0 if the rig is unknown.
+        """
+        rig = self._items.get(rig_id)
+        if rig is None:
+            return 0
+        created = 0
+        for li in rig.lights:
+            light_data = bpy_module.data.lights.new(
+                name=f"{li.name} (rig)", type=li.type,
+            )
+            light_data.energy = li.energy
+            light_data.color = li.color[:3]
+            if li.type == "SPOT" and li.size:
+                light_data.spot_size = li.size
+            if li.type == "AREA" and li.size:
+                light_data.size = li.size
+
+            obj = bpy_module.data.objects.new(name=f"{li.name} (rig)", object_data=light_data)
+            obj.location = li.location[:3]
+            obj.rotation_euler = li.rotation_euler[:3]
+            scene.collection.objects.link(obj)
+            created += 1
+        return created

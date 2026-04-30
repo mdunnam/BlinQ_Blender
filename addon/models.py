@@ -260,6 +260,75 @@ class ReviewSnapshot:
 
 
 @dataclass
+class LightInfo:
+    """Serialised state of a single Blender light object.
+
+    Attributes:
+        name: The Blender object name.
+        type: ``POINT`` / ``SUN`` / ``SPOT`` / ``AREA``.
+        location: World-space x/y/z.
+        rotation_euler: Euler XYZ rotation in radians.
+        energy: Light energy / power.
+        color: RGB color (0–1 floats).
+        size: For SPOT (cone radius) or AREA (size) lights; 0 otherwise.
+    """
+
+    name: str = ""
+    type: str = "POINT"
+    location: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
+    rotation_euler: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
+    energy: float = 1000.0
+    color: list[float] = field(default_factory=lambda: [1.0, 1.0, 1.0])
+    size: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a plain dictionary."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> LightInfo:
+        """Deserialize from a plain dictionary, ignoring unknown keys."""
+        known = {f for f in cls.__dataclass_fields__}
+        return cls(**{k: v for k, v in data.items() if k in known})
+
+
+@dataclass
+class LightRig:
+    """A named collection of light snapshots that can be re-applied to a scene.
+
+    Attributes:
+        id: Stable UUID4.
+        name: Display name.
+        lights: Ordered list of LightInfo entries.
+        created_at: ISO-8601 UTC timestamp.
+    """
+
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    name: str = ""
+    lights: list[LightInfo] = field(default_factory=list)
+    created_at: str = field(default_factory=_now)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a plain dictionary."""
+        return {
+            "id": self.id,
+            "name": self.name,
+            "lights": [li.to_dict() for li in self.lights],
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> LightRig:
+        """Deserialize from a plain dictionary, ignoring unknown keys."""
+        return cls(
+            id=str(data.get("id", "")) or str(uuid.uuid4()),
+            name=str(data.get("name", "")),
+            lights=[LightInfo.from_dict(d) for d in (data.get("lights") or []) if isinstance(d, dict)],
+            created_at=str(data.get("created_at", _now())),
+        )
+
+
+@dataclass
 class RenderPreset:
     """A snapshot of render-relevant scene settings.
 

@@ -11,11 +11,16 @@ from pathlib import Path
 import bpy
 from bpy.props import EnumProperty, StringProperty
 
-from .. import diagnostics
+from .. import diagnostics, usage
 from ..assets.index import CatalogManager, MetadataMapper, XMDIndex
 from ..assets.previews import PreviewManager
 from ..models import RetopoState
 from ..prefs import get_prefs
+
+
+def _usage_blend(context: bpy.types.Context) -> tuple[str, str]:
+    """Return (blend_file, scene_name) used to enrich usage records."""
+    return (bpy.data.filepath or "", context.scene.name)
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +178,15 @@ class BLINQ_OT_register_asset(bpy.types.Operator):
         diagnostics.info(
             "asset",
             f"registered '{datablock.name}' ({record.asset_type}) uuid={record.xmd_uuid[:8]}",
+        )
+        blend_file, scene_name = _usage_blend(context)
+        usage.log(
+            prefs.library_path,
+            event="asset.registered",
+            asset_uuid=record.xmd_uuid,
+            blend_file=blend_file,
+            scene_name=scene_name,
+            payload={"name": datablock.name, "type": record.asset_type},
         )
         self.report(
             {"INFO"},
@@ -692,6 +706,18 @@ class BLINQ_OT_send_mesh(bpy.types.Operator):
                 "bridge",
                 f"sent mesh: {result['objects']} object(s) \u2192 {result['file']}",
             )
+            blend_file, scene_name = _usage_blend(context)
+            usage.log(
+                prefs.library_path,
+                event="bridge.send_mesh",
+                blend_file=blend_file,
+                scene_name=scene_name,
+                payload={
+                    "file": result["file"],
+                    "objects": result["objects"],
+                    "uuids": result["uuids"],
+                },
+            )
             self.report(
                 {"INFO"},
                 f"Sent {result['objects']} object(s) \u2014 {result['file']}",
@@ -699,6 +725,46 @@ class BLINQ_OT_send_mesh(bpy.types.Operator):
             return {"FINISHED"}
         except Exception as exc:
             diagnostics.error("bridge", f"send mesh failed: {exc}")
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+
+class BLINQ_OT_send_meshes_each(bpy.types.Operator):
+    """Send each selected mesh as a separate OBJ (SubTool-style multi-send)."""
+
+    bl_idname = "blinq.send_meshes_each"
+    bl_label = "Send Each → SubTools"
+    bl_description = (
+        "Export each selected mesh object as its own OBJ in mesh_out/ "
+        "and signal XMD Desktop to receive them as separate SubTools"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        return any(o.type == "MESH" for o in context.selected_objects)
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        prefs = get_prefs(context)
+        transport = _get_transport(prefs)
+        if transport is None:
+            self.report({"WARNING"}, "Set the Bridge Work Directory in Add-on Preferences first")
+            return {"CANCELLED"}
+        try:
+            from ..bridge.io import MeshExporter
+            result = MeshExporter(transport).execute_per_object()
+            diagnostics.info(
+                "bridge",
+                f"sent {result['objects']} object(s) as SubTools "
+                f"({len(result['files'])} file(s))",
+            )
+            self.report(
+                {"INFO"},
+                f"Sent {result['objects']} object(s) as SubTools",
+            )
+            return {"FINISHED"}
+        except Exception as exc:
+            diagnostics.error("bridge", f"send-each failed: {exc}")
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
 
@@ -1067,6 +1133,101 @@ class BLINQ_OT_workflow_delete(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class BLINQ_OT_workflow_export(bpy.types.Operator):
+    """Export the active workflow stack to a JSON file."""
+
+    bl_idname = "blinq.workflow_export"
+    bl_label = "Export Stack…"
+    bl_description = "Save the active workflow stack as a portable JSON file"
+    bl_options = {"REGISTER"}
+
+    filepath: StringProperty(subtype="FILE_PATH", default="workflow.json")  # type: ignore[assignment]
+    filter_glob: StringProperty(default="*.json", options={"HIDDEN"})  # type: ignore[assignment]
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        return bool(getattr(context.scene, "xmd_active_workflow_id", ""))
+
+    def invoke(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
+        svc = _workflow_service(context)
+        stack = svc.get(context.scene.xmd_active_workflow_id) if svc else None
+        if stack is None:
+            return {"CANCELLED"}
+        # Sanitise the suggested filename
+        safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in stack.name) or "workflow"
+        self.filepath = f"{safe}.xmdwork.json"
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        import json
+        svc = _workflow_service(context)
+        if svc is None:
+            return {"CANCELLED"}
+        stack = svc.get(context.scene.xmd_active_workflow_id)
+        if stack is None:
+            return {"CANCELLED"}
+        try:
+            Path(self.filepath).write_text(
+                json.dumps({"schema_version": "1", "stack": stack.to_dict()},
+                           indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            self.report({"ERROR"}, f"Export failed: {exc}")
+            return {"CANCELLED"}
+        diagnostics.info("workflow", f"exported '{stack.name}' → {Path(self.filepath).name}")
+        self.report({"INFO"}, f"Exported to {Path(self.filepath).name}")
+        return {"FINISHED"}
+
+
+class BLINQ_OT_workflow_import(bpy.types.Operator):
+    """Import a workflow stack from a JSON file."""
+
+    bl_idname = "blinq.workflow_import"
+    bl_label = "Import Stack…"
+    bl_description = "Import a workflow stack from a JSON file"
+    bl_options = {"REGISTER", "UNDO"}
+
+    filepath: StringProperty(subtype="FILE_PATH", default="")  # type: ignore[assignment]
+    filter_glob: StringProperty(default="*.json", options={"HIDDEN"})  # type: ignore[assignment]
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        return bool(get_prefs(context).library_path)
+
+    def invoke(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        import json
+        import uuid
+        from ..models import WorkflowStack
+
+        svc = _workflow_service(context)
+        if svc is None:
+            return {"CANCELLED"}
+        try:
+            data = json.loads(Path(self.filepath).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            self.report({"ERROR"}, f"Import failed: {exc}")
+            return {"CANCELLED"}
+        stack_data = data.get("stack")
+        if not isinstance(stack_data, dict):
+            self.report({"ERROR"}, "File does not contain a workflow stack")
+            return {"CANCELLED"}
+        stack = WorkflowStack.from_dict(stack_data)
+        # Re-issue ID so an imported stack never collides with an existing one
+        stack.id = str(uuid.uuid4())
+        svc._stacks[stack.id] = stack  # type: ignore[attr-defined]
+        svc.save()
+        context.scene.xmd_active_workflow_id = stack.id
+        diagnostics.info("workflow", f"imported stack '{stack.name}' ({len(stack.steps)} steps)")
+        self.report({"INFO"}, f"Imported '{stack.name}'")
+        return {"FINISHED"}
+
+
 class BLINQ_MT_workflow_stacks(bpy.types.Menu):
     """Dropdown menu listing all workflow stacks for selection."""
 
@@ -1096,6 +1257,9 @@ class BLINQ_MT_workflow_stacks(bpy.types.Menu):
             layout.operator("blinq.workflow_clear_active", icon="X")
         layout.separator()
         layout.operator("blinq.workflow_create", icon="ADD")
+        layout.operator("blinq.workflow_import", icon="IMPORT")
+        if getattr(context.scene, "xmd_active_workflow_id", ""):
+            layout.operator("blinq.workflow_export", icon="EXPORT")
 
 
 class BLINQ_OT_set_retopo_state(bpy.types.Operator):
@@ -1213,8 +1377,199 @@ class BLINQ_OT_set_retopo_objects(bpy.types.Operator):
 
 
 # ---------------------------------------------------------------------------
+# ── Light Rig operators ──────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+def _light_rig_service(context: bpy.types.Context):
+    """Return a loaded LightRigService, or None."""
+    prefs = get_prefs(context)
+    if not prefs.library_path:
+        return None
+    from ..integrations.render import LightRigService
+    svc = LightRigService(Path(prefs.library_path))
+    svc.load()
+    return svc
+
+
+class BLINQ_OT_light_rig_save(bpy.types.Operator):
+    """Save every LIGHT object in the current scene as a named light rig."""
+
+    bl_idname = "blinq.light_rig_save"
+    bl_label = "Save Light Rig"
+    bl_description = "Capture all LIGHT objects in the current scene as a named light rig"
+    bl_options = {"REGISTER", "UNDO"}
+
+    name: StringProperty(name="Rig Name", default="")  # type: ignore[assignment]
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        if not get_prefs(context).library_path:
+            return False
+        return any(o.type == "LIGHT" for o in context.scene.objects)
+
+    def invoke(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
+        from datetime import datetime as _dt
+        self.name = f"Rig {_dt.now().strftime('%Y%m%d-%H%M')}"
+        return context.window_manager.invoke_props_dialog(self, width=300)
+
+    def draw(self, context: bpy.types.Context) -> None:
+        layout = self.layout
+        layout.prop(self, "name", text="Name")
+        light_count = sum(1 for o in context.scene.objects if o.type == "LIGHT")
+        col = layout.column(align=True)
+        col.label(text=f"Will capture {light_count} light(s):", icon="LIGHT")
+        for obj in context.scene.objects:
+            if obj.type != "LIGHT":
+                continue
+            row = col.row()
+            row.enabled = False
+            row.label(text=f"  {obj.name} ({obj.data.type})")
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        name = self.name.strip()
+        if not name:
+            self.report({"WARNING"}, "Rig name cannot be empty")
+            return {"CANCELLED"}
+        svc = _light_rig_service(context)
+        if svc is None:
+            self.report({"WARNING"}, "Set the XMD Library Path in Add-on Preferences first")
+            return {"CANCELLED"}
+        rig = svc.capture_from_scene(name=name, scene=context.scene)
+        diagnostics.info("render", f"saved light rig '{rig.name}' ({len(rig.lights)} light(s))")
+        self.report({"INFO"}, f"Saved '{rig.name}' ({len(rig.lights)} light(s))")
+        return {"FINISHED"}
+
+
+class BLINQ_OT_light_rig_apply(bpy.types.Operator):
+    """Add a saved light rig's lights to the current scene."""
+
+    bl_idname = "blinq.light_rig_apply"
+    bl_label = "Apply Light Rig"
+    bl_description = "Add all lights from a saved rig into the current scene"
+    bl_options = {"REGISTER", "UNDO"}
+
+    rig_id: StringProperty(name="Rig ID", default="")  # type: ignore[assignment]
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        svc = _light_rig_service(context)
+        if svc is None:
+            return {"CANCELLED"}
+        rig = svc.get(self.rig_id)
+        if rig is None:
+            return {"CANCELLED"}
+        created = svc.apply_to_scene(self.rig_id, context.scene, bpy)
+        diagnostics.info("render", f"applied rig '{rig.name}': {created} light(s) added")
+        self.report({"INFO"}, f"Added {created} light(s)")
+        return {"FINISHED"}
+
+
+class BLINQ_OT_light_rig_delete(bpy.types.Operator):
+    """Delete a saved light rig from the library."""
+
+    bl_idname = "blinq.light_rig_delete"
+    bl_label = "Delete Light Rig"
+    bl_description = "Permanently delete this light rig from the library"
+    bl_options = {"REGISTER", "UNDO"}
+
+    rig_id: StringProperty(name="Rig ID", default="")  # type: ignore[assignment]
+
+    def invoke(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        svc = _light_rig_service(context)
+        if svc is None:
+            return {"CANCELLED"}
+        if svc.remove(self.rig_id):
+            diagnostics.info("render", f"deleted light rig {self.rig_id[:8]}")
+            return {"FINISHED"}
+        return {"CANCELLED"}
+
+
+# ---------------------------------------------------------------------------
 # ── Library audit + batch QC ─────────────────────────────────────────────
 # ---------------------------------------------------------------------------
+
+class BLINQ_OT_audit_blend_dependencies(bpy.types.Operator):
+    """List which XMD library assets are used in the current .blend file."""
+
+    bl_idname = "blinq.audit_blend_dependencies"
+    bl_label = "Audit This Blend"
+    bl_description = (
+        "Scan the current .blend for datablocks tagged with xmd_uuid and "
+        "show which ones match XMD Library records"
+    )
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        return bool(get_prefs(context).library_path)
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        prefs = get_prefs(context)
+        index = XMDIndex(Path(prefs.library_path))
+        index.load()
+
+        # Walk all datablock collections that BlinQ can register
+        matched: list[tuple[str, str, str]] = []   # (name, type, uuid8)
+        unmatched: list[tuple[str, str, str]] = [] # same shape — uuid set but no library record
+        for coll_name in _TYPE_TO_COLLECTION.values():
+            coll = getattr(bpy.data, coll_name, None)
+            if coll is None:
+                continue
+            for db in coll:
+                uuid_val = str(db.get("xmd_uuid", ""))
+                if not uuid_val:
+                    continue
+                type_label = type(db).__name__
+                row = (db.name, type_label, uuid_val[:8])
+                if index.get(uuid_val):
+                    matched.append(row)
+                else:
+                    unmatched.append(row)
+
+        diagnostics.info(
+            "audit",
+            f"blend audit: matched={len(matched)} unmatched={len(unmatched)} "
+            f"library_total={len(index)}",
+        )
+
+        def draw_popup(self_popup, _ctx):
+            layout = self_popup.layout
+            layout.label(
+                text=f"This .blend uses {len(matched) + len(unmatched)} XMD-tagged datablock(s)",
+                icon="ASSET_MANAGER",
+            )
+            if matched:
+                layout.separator()
+                layout.label(text=f"Matched in library ({len(matched)}):", icon="CHECKMARK")
+                for name, type_label, u8 in matched[:8]:
+                    row = layout.row()
+                    row.enabled = False
+                    row.label(text=f"  {name}  ({type_label} {u8}…)")
+                if len(matched) > 8:
+                    layout.label(text=f"  … and {len(matched) - 8} more")
+            if unmatched:
+                layout.separator()
+                layout.label(text=f"Tagged but not in library ({len(unmatched)}):", icon="ERROR")
+                for name, type_label, u8 in unmatched[:8]:
+                    row = layout.row()
+                    row.alert = True
+                    row.label(text=f"  {name}  ({type_label} {u8}…)")
+                if len(unmatched) > 8:
+                    layout.label(text=f"  … and {len(unmatched) - 8} more")
+            if not matched and not unmatched:
+                layout.label(text="No XMD-tagged datablocks found", icon="INFO")
+
+        context.window_manager.popup_menu(
+            draw_popup, title="Blend Dependency Audit", icon="ASSET_MANAGER"
+        )
+        self.report(
+            {"INFO"},
+            f"Blend audit: {len(matched)} matched, {len(unmatched)} unmatched",
+        )
+        return {"FINISHED"}
+
 
 class BLINQ_OT_audit_library(bpy.types.Operator):
     """Audit the XMD library index for orphans, missing UUIDs, and missing files."""
@@ -2200,6 +2555,9 @@ def _asset_browser_menu(self: bpy.types.Menu, context: bpy.types.Context) -> Non
     layout.operator("blinq.push_metadata", icon="EXPORT")
     layout.operator("blinq.pull_metadata", icon="IMPORT")
     layout.operator("blinq.sync_preview", icon="FILE_REFRESH")
+    layout.separator()
+    layout.operator("blinq.refresh_all_previews", icon="RENDER_RESULT")
+    layout.operator("blinq.audit_library", icon="VIEWZOOM")
 
 
 # ---------------------------------------------------------------------------
@@ -2248,6 +2606,7 @@ _CLASSES = [
     BLINQ_OT_check_activation,
     # Bridge
     BLINQ_OT_send_mesh,
+    BLINQ_OT_send_meshes_each,
     BLINQ_OT_receive_mesh,
     BLINQ_OT_send_texture,
     # Retopo
@@ -2265,6 +2624,8 @@ _CLASSES = [
     BLINQ_OT_workflow_advance,
     BLINQ_OT_workflow_set_step,
     BLINQ_OT_workflow_delete,
+    BLINQ_OT_workflow_export,
+    BLINQ_OT_workflow_import,
     BLINQ_MT_workflow_stacks,
     # Reference board
     BLINQ_OT_reference_add,
@@ -2282,8 +2643,13 @@ _CLASSES = [
     BLINQ_OT_render_preset_save,
     BLINQ_OT_render_preset_apply,
     BLINQ_OT_render_preset_delete,
+    # Light rigs
+    BLINQ_OT_light_rig_save,
+    BLINQ_OT_light_rig_apply,
+    BLINQ_OT_light_rig_delete,
     # Library QC
     BLINQ_OT_audit_library,
+    BLINQ_OT_audit_blend_dependencies,
     BLINQ_OT_refresh_all_previews,
     # World / HDRI
     BLINQ_OT_load_hdri,

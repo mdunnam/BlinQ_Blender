@@ -262,6 +262,7 @@ class BLINQ_PT_bridge(bpy.types.Panel):
         row.operator("blinq.receive_mesh", icon="IMPORT")
 
         col.scale_y = 1.0
+        col.operator("blinq.send_meshes_each", icon="OUTLINER_OB_GROUP_INSTANCE")
         col.operator("blinq.send_texture", icon="IMAGE_DATA")
 
         layout.separator(factor=0.3)
@@ -332,8 +333,9 @@ class BLINQ_PT_library(bpy.types.Panel):
         layout.separator(factor=0.5)
         # Batch QC + world tools
         row = layout.row(align=True)
-        row.operator("blinq.audit_library", icon="VIEWZOOM", text="Audit")
-        row.operator("blinq.refresh_all_previews", icon="FILE_REFRESH", text="All Previews")
+        row.operator("blinq.audit_library", icon="VIEWZOOM", text="Audit Lib")
+        row.operator("blinq.audit_blend_dependencies", icon="FILE_3D", text="Audit Blend")
+        layout.operator("blinq.refresh_all_previews", icon="FILE_REFRESH", text="Refresh All Previews")
         layout.operator("blinq.load_hdri", icon="WORLD_DATA", text="Load HDRI\u2026")
 
         layout.separator(factor=0.5)
@@ -900,7 +902,89 @@ class BLINQ_PT_render_presets(bpy.types.Panel):
 
 
 # ---------------------------------------------------------------------------
-# Panel 10 — Diagnostics
+# Panel 10 — Light Rigs
+# ---------------------------------------------------------------------------
+
+_MAX_RIGS_DRAWN = 8
+
+
+class BLINQ_PT_light_rigs(bpy.types.Panel):
+    """Saved light setups — add named light rigs back into a scene."""
+
+    bl_label = "Light Rigs"
+    bl_idname = "BLINQ_PT_light_rigs"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "XMD"
+    bl_order = 9
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw_header(self, context: bpy.types.Context) -> None:
+        prefs = get_prefs(context)
+        if not prefs.library_path:
+            self.layout.label(text="", icon="LIGHT")
+            return
+        try:
+            from ..integrations.render import LightRigService
+            svc = LightRigService(Path(prefs.library_path))
+            svc.load()
+            count = len(svc.all())
+            self.layout.label(text=str(count) if count else "", icon="LIGHT")
+        except Exception:
+            self.layout.label(text="", icon="LIGHT")
+
+    def draw(self, context: bpy.types.Context) -> None:
+        layout = self.layout
+        prefs = get_prefs(context)
+
+        if not prefs.library_path:
+            row = layout.row()
+            row.alert = True
+            row.label(text="No library path set", icon="ERROR")
+            return
+
+        from ..integrations.render import LightRigService
+        svc = LightRigService(Path(prefs.library_path))
+        svc.load()
+        items = svc.all()
+
+        light_count = sum(1 for o in context.scene.objects if o.type == "LIGHT")
+        row = layout.row(align=True)
+        row.scale_y = 1.2
+        sub = row.row(align=True)
+        sub.enabled = light_count > 0
+        sub.scale_y = 1.2
+        sub.operator(
+            "blinq.light_rig_save",
+            icon="ADD",
+            text=f"Save Current ({light_count} light{'s' if light_count != 1 else ''})",
+        )
+
+        if not items:
+            layout.label(text="No saved rigs yet", icon="INFO")
+            return
+
+        col = layout.column(align=True)
+        for rig in items[:_MAX_RIGS_DRAWN]:
+            row = col.row(align=True)
+            op_apply = row.operator(
+                "blinq.light_rig_apply",
+                text=f"{rig.name}  ({len(rig.lights)} lt)",
+                icon="LIGHT",
+            )
+            op_apply.rig_id = rig.id
+            op_del = row.operator("blinq.light_rig_delete", text="", icon="X")
+            op_del.rig_id = rig.id
+
+        if len(items) > _MAX_RIGS_DRAWN:
+            layout.label(
+                text=f"… {len(items) - _MAX_RIGS_DRAWN} more not shown",
+                icon="INFO",
+            )
+
+
+# ---------------------------------------------------------------------------
+# Panel 11 — Diagnostics
 # ---------------------------------------------------------------------------
 
 _DIAG_LEVEL_ICONS: dict[str, str] = {
@@ -922,7 +1006,7 @@ class BLINQ_PT_diagnostics(bpy.types.Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "XMD"
-    bl_order = 9
+    bl_order = 10
     bl_options = {"DEFAULT_CLOSED"}
 
     def draw_header(self, context: bpy.types.Context) -> None:
@@ -998,6 +1082,7 @@ _CLASSES = [
     BLINQ_PT_reference,
     BLINQ_PT_snapshots,
     BLINQ_PT_render_presets,
+    BLINQ_PT_light_rigs,
     BLINQ_PT_diagnostics,
 ]
 
