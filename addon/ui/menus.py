@@ -487,7 +487,7 @@ class BLINQ_OT_gallery_clear_filters(bpy.types.Operator):
         """
         scene = context.scene
         scene.xmd_gallery_search_text = ""
-        scene.xmd_gallery_filter_type = ""
+        scene.xmd_gallery_filter_type = "ALL"
         return {"FINISHED"}
 
 
@@ -3373,7 +3373,7 @@ def register() -> None:
         name="Asset Type",
         description="Filter assets by type",
         items=[
-            ("", "All Types", ""),
+            ("ALL", "All Types", ""),
             ("OBJECT", "Objects", ""),
             ("MATERIAL", "Materials", ""),
             ("BRUSH", "Brushes", ""),
@@ -3384,7 +3384,7 @@ def register() -> None:
             ("WORLD", "Worlds", ""),
             ("SCENE", "Scenes", ""),
         ],
-        default="",
+        default="ALL",
     )
 
     # Advanced gallery features
