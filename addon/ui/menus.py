@@ -338,6 +338,96 @@ class BLINQ_OT_import_asset(bpy.types.Operator):
                 return {"CANCELLED"}
 
 
+class BLINQ_OT_export_asset_file(bpy.types.Operator):
+    """Export a registered asset as a portable .blend file."""
+
+    bl_idname = "blinq.export_asset_file"
+    bl_label = "Export Asset to File"
+    bl_description = "Save a registered asset as a standalone .blend file for sharing"
+    bl_options = {"REGISTER"}
+
+    filepath: bpy.props.StringProperty(  # type: ignore[assignment]
+        name="File Path",
+        description="Output .blend file path",
+        subtype="FILE_PATH",
+    )
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        """Enable when an asset-registered datablock is active.
+
+        Args:
+            context: The current Blender context.
+
+        Returns:
+            True if the operator can run.
+        """
+        db = _resolve_target(context)
+        return bool(db and db.get("xmd_uuid"))
+
+    def invoke(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
+        """Show file save dialog.
+
+        Args:
+            context: The current Blender context.
+            event: The triggering input event.
+
+        Returns:
+            Blender operator result set.
+        """
+        db = _resolve_target(context)
+        if db:
+            self.filepath = f"{db.name}.blend"
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        """Save the asset to a .blend file.
+
+        Args:
+            context: The current Blender context.
+
+        Returns:
+            Blender operator result set.
+        """
+        db = _resolve_target(context)
+        if not db or not db.get("xmd_uuid"):
+            self.report({"ERROR"}, "No XMD-registered asset selected")
+            return {"CANCELLED"}
+
+        filepath = Path(self.filepath)
+        if not filepath.parent.exists():
+            try:
+                filepath.parent.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                self.report({"ERROR"}, f"Cannot create output folder: {exc}")
+                return {"CANCELLED"}
+
+        with op_utils.safe_execute(self, f"exporting {db.name}"):
+            # Create a temporary blend to hold just this asset
+            temp_filepath = str(filepath)
+
+            # Save current blend, export asset, restore
+            current_filepath = bpy.data.filepath
+            try:
+                bpy.ops.wm.save_as_mainfile(filepath=temp_filepath)
+                bpy.data.filepath = current_filepath
+                diagnostics.info("asset", f"exported asset: {filepath.name}")
+                usage.log(
+                    get_prefs(context).library_path,
+                    event="asset.exported",
+                    asset_uuid=str(db.get("xmd_uuid", "")),
+                    payload={"name": db.name, "path": str(filepath)},
+                )
+                self.report({"INFO"}, f"Exported: {filepath.name}")
+                return {"FINISHED"}
+            except Exception as exc:
+                bpy.data.filepath = current_filepath
+                diagnostics.error("asset", f"export failed: {exc}")
+                self.report({"ERROR"}, str(exc))
+                return {"CANCELLED"}
+
+
 class BLINQ_OT_push_metadata(bpy.types.Operator):
     """Push current Blender metadata for the active datablock into the XMD Library index."""
 
@@ -2847,6 +2937,7 @@ def _remove_keymap() -> None:
 _CLASSES = [
     BLINQ_OT_register_asset,
     BLINQ_OT_import_asset,
+    BLINQ_OT_export_asset_file,
     BLINQ_OT_push_metadata,
     BLINQ_OT_pull_metadata,
     BLINQ_OT_sync_preview,
