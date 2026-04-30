@@ -338,6 +338,112 @@ class BLINQ_OT_import_asset(bpy.types.Operator):
                 return {"CANCELLED"}
 
 
+class BLINQ_OT_import_assets_folder(bpy.types.Operator):
+    """Import multiple asset .blend files from a folder into the library."""
+
+    bl_idname = "blinq.import_assets_folder"
+    bl_label = "Batch Import Assets"
+    bl_description = "Import multiple .blend files from a folder into the XMD Library"
+    bl_options = {"REGISTER"}
+
+    directory: bpy.props.StringProperty(  # type: ignore[assignment]
+        name="Folder",
+        description="Source folder containing .blend files",
+        subtype="DIR_PATH",
+    )
+
+    def invoke(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
+        """Show folder picker.
+
+        Args:
+            context: The current Blender context.
+            event: The triggering input event.
+
+        Returns:
+            Blender operator result set.
+        """
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        """Import all .blend files from the selected folder.
+
+        Args:
+            context: The current Blender context.
+
+        Returns:
+            Blender operator result set.
+        """
+        folder = Path(self.directory)
+        if not folder.exists() or not folder.is_dir():
+            self.report({"ERROR"}, f"Invalid folder: {folder}")
+            return {"CANCELLED"}
+
+        with op_utils.safe_execute(self, f"importing from {folder.name}"):
+            prefs = get_prefs(context)
+            if not op_utils.ensure_library_path(self, prefs):
+                return {"CANCELLED"}
+
+            lib_path = Path(prefs.library_path)
+            blend_files = list(folder.glob("*.blend"))
+            if not blend_files:
+                self.report({"WARNING"}, f"No .blend files found in {folder.name}")
+                return {"CANCELLED"}
+
+            imported_count = 0
+            failed = []
+
+            for src_blend in blend_files:
+                try:
+                    # Copy file to library with unique name
+                    dst_name = src_blend.stem + ".blend"
+                    # If name collision, append a number
+                    dst_path = lib_path / dst_name
+                    counter = 1
+                    while dst_path.exists():
+                        dst_path = lib_path / f"{src_blend.stem}_{counter:03d}.blend"
+                        counter += 1
+
+                    # Copy the file
+                    import shutil
+                    shutil.copy2(str(src_blend), str(dst_path))
+
+                    # Create library entry
+                    from ..models import AssetRecord, AssetType
+                    index = XMDIndex(lib_path)
+                    index.load()
+                    catalog = CatalogManager(lib_path)
+                    catalog.load()
+
+                    record = AssetRecord(
+                        name=src_blend.stem,
+                        asset_type=AssetType.UNKNOWN.value,
+                        author=prefs.xmdsource_display_name or "Imported",
+                        blend_file=dst_path.relative_to(lib_path).as_posix(),
+                    )
+                    record.catalog_id = catalog.get_or_create("XMD/Imported")
+                    record.catalog_path = "XMD/Imported"
+                    index._records[record.xmd_uuid] = record
+                    index.save()
+                    catalog.save()
+                    imported_count += 1
+                    diagnostics.info("asset", f"batch imported: {src_blend.name}")
+                except Exception as exc:
+                    failed.append(src_blend.name)
+                    diagnostics.warn("asset", f"failed to import {src_blend.name}: {exc}")
+
+            summary = f"Imported {imported_count} asset(s)"
+            if failed:
+                summary += f" ({len(failed)} failed)"
+            self.report({"INFO"}, summary)
+            usage.log(
+                prefs.library_path,
+                event="asset.batch_imported",
+                payload={"imported": imported_count, "failed": len(failed)},
+            )
+            return {"FINISHED"}
+
+
 class BLINQ_OT_export_asset_file(bpy.types.Operator):
     """Export a registered asset as a portable .blend file."""
 
@@ -2937,6 +3043,7 @@ def _remove_keymap() -> None:
 _CLASSES = [
     BLINQ_OT_register_asset,
     BLINQ_OT_import_asset,
+    BLINQ_OT_import_assets_folder,
     BLINQ_OT_export_asset_file,
     BLINQ_OT_push_metadata,
     BLINQ_OT_pull_metadata,
