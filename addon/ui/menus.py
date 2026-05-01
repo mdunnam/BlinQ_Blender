@@ -350,6 +350,23 @@ class BLINQ_OT_gallery_set_type_filter(bpy.types.Operator):
         name="Filter Type", default=""
     )
 
+    _LABELS: dict[str, str] = {
+        "ALL": "All Assets",
+        "OBJECT": "Objects",
+        "MATERIAL": "Materials",
+        "BRUSH": "Brushes",
+        "IMAGE": "Images",
+        "TEXTURE": "Textures",
+        "NODE_GROUP": "Node Groups",
+        "COLLECTION": "Collections",
+        "WORLD": "Worlds",
+        "SCENE": "Scenes",
+    }
+
+    @classmethod
+    def description(cls, context: bpy.types.Context, properties) -> str:
+        return cls._LABELS.get(properties.filter_type, properties.filter_type)
+
     def execute(self, context: bpy.types.Context) -> set[str]:
         """Set the type filter.
 

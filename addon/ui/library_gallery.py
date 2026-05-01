@@ -26,15 +26,17 @@ _TYPE_ICONS: dict[str, str] = {
 }
 
 ASSET_CATEGORIES = [
-    ("ALL",        "All",        "RESTRICT_VIEW_OFF"),
-    ("OBJECT",     "Objects",    "OBJECT_DATA"),
-    ("MATERIAL",   "Materials",  "MATERIAL"),
-    ("BRUSH",      "Brushes",    "BRUSH_DATA"),
-    ("IMAGE",      "Images",     "IMAGE_DATA"),
-    ("TEXTURE",    "Textures",   "TEXTURE"),
-    ("COLLECTION", "Collections","OUTLINER_COLLECTION"),
-    ("WORLD",      "Worlds",     "WORLD"),
+    ("ALL",        "All Assets",   "RESTRICT_VIEW_OFF"),
+    ("OBJECT",     "Objects",      "OBJECT_DATA"),
+    ("MATERIAL",   "Materials",    "MATERIAL"),
+    ("BRUSH",      "Brushes",      "BRUSH_DATA"),
+    ("IMAGE",      "Images",       "IMAGE_DATA"),
+    ("TEXTURE",    "Textures",     "TEXTURE"),
+    ("COLLECTION", "Collections",  "OUTLINER_COLLECTION"),
+    ("WORLD",      "Worlds",       "WORLD"),
 ]
+
+_CATEGORY_LABEL: dict[str, str] = {t: label for t, label, _ in ASSET_CATEGORIES}
 
 
 class BLINQ_PG_AssetSelection(bpy.types.PropertyGroup):
@@ -138,6 +140,10 @@ class BLINQ_PT_library_gallery(bpy.types.Panel):
 
     def _draw_search_and_grid(self, layout, scene, all_assets, filtered):
         """Search bar, column control, asset grid, and detail panel."""
+        # Category header
+        current_label = _CATEGORY_LABEL.get(scene.xmd_gallery_filter_type, "Library")
+        layout.label(text=current_label, icon="ASSET_MANAGER")
+
         # Search bar
         row = layout.row(align=True)
         row.prop(scene, "xmd_gallery_search_text", text="", icon="VIEWZOOM")
